@@ -1,9 +1,14 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { logLatency } from "./latency-logger.js";
 import { resolvePackagePath } from "./package-root.js";
-import { findNearestContaining, walkUpDirs } from "./path-utils.js";
+import {
+	findNearestContaining,
+	findNearestMarkerRoot,
+	walkUpDirs,
+} from "./path-utils.js";
 import type { ProjectConventions } from "./project-conventions.js";
 import { loadProjectSnapshotWithoutWordIndex } from "./project-snapshot.js";
 
@@ -1960,6 +1965,90 @@ export function getBiomeConfigPath(cwd: string): string | undefined {
 	return undefined;
 }
 
+const BIOME_CONFIG_NAMES = ["biome.jsonc", "biome.json"] as const;
+
+/**
+ * First existing biome config among `names` inside `dir`, or undefined.
+ * `biome.jsonc` is checked before `biome.json` (matches `getBiomeConfigPath`).
+ */
+function firstBiomeConfigIn(dir: string): string | undefined {
+	for (const name of BIOME_CONFIG_NAMES) {
+		const p = path.join(dir, name);
+		if (fs.existsSync(p)) return p;
+	}
+	return undefined;
+}
+
+/**
+ * Nearest project root for `cwd`: the closest ancestor containing a `.git`
+ * directory. `.git` is the true repo anchor (one per repo, unlike `package.json`
+ * which monorepos scatter across sub-packages); a non-git project falls back to
+ * the nearest `package.json`. `findNearestMarkerRoot` never resolves at or
+ * above $HOME, so an in-repo walk cannot escape the user's workspace.
+ */
+export function findBiomeProjectRoot(cwd: string): string | null {
+	return (
+		findNearestMarkerRoot(cwd, [".git"]) ??
+		findNearestMarkerRoot(cwd, ["package.json"])
+	);
+}
+
+/**
+ * Resolve the biome config to apply for `cwd`, topmost precedence first:
+ *
+ * 1. Project-internal biome config — nearest `biome.json(c)` walking up from
+ *    `cwd`, bounded by the repo's `.git` so a monorepo sub-package finds the
+ *    root config but a search never escapes the repo (or $HOME) to pick up an
+ *    unrelated parent's config.
+ * 2. Project-scoped personal config — `{projectRoot}/.pi/.extensions/pi-lens/`.
+ *    Shipped in-repo but kept separate from tracked `biome.json`. The user can
+ *    opt a whole repo's `.pi` into the style canon without per-dir overrides.
+ * 3. Global personal config — `~/.pi/.extensions/pi-lens/` (machine-wide biome
+ *    preferences). The base is hardcoded to `~/.pi` and can be overridden via
+ *    `PI_LENS_USER_CONFIG_DIR` (used by tests to stay hermetic; the env var
+ *    replaces the home prefix, so `PI_LENS_USER_CONFIG_DIR=/x` resolves
+ *    `/x/.extensions/pi-lens/`).
+ * 4. Internal fallback — the package-owned `config/biome/core.jsonc`, applied
+ *    by `biomeConfigArgs` when this returns `undefined`.
+ *
+ * Keep this independent of `getBiomeConfigPath` (which is a pure upward detector
+ * shared by `hasBiomeConfig` and existing tests). `resolveBiomeConfigPath` is the
+ * application-facing precedence chain.
+ */
+export function resolveBiomeConfigPath(
+	cwd: string,
+	opts: { userDir?: string } = {},
+): string | undefined {
+	// 1. Project-internal, bounded by the repo's .git (markers win over the
+	//    boundary at the same dir, so a root biome.json + .git co-location works).
+	const projectConfigDir = findNearestMarkerRoot(cwd, BIOME_CONFIG_NAMES, {
+		boundaries: [".git"],
+	});
+	if (projectConfigDir) {
+		const p = firstBiomeConfigIn(projectConfigDir);
+		if (p) return p;
+	}
+
+	// 2. Project-scoped personal config.
+	const projectRoot = findBiomeProjectRoot(cwd);
+	if (projectRoot) {
+		const p = firstBiomeConfigIn(
+			path.join(projectRoot, ".pi", ".extensions", "pi-lens"),
+		);
+		if (p) return p;
+	}
+
+	// 3. Global personal config (hardcoded ~/.pi base; env override for tests).
+	const userDir =
+		opts.userDir ??
+		process.env.PI_LENS_USER_CONFIG_DIR ??
+		path.join(os.homedir(), ".pi");
+	const p = firstBiomeConfigIn(path.join(userDir, ".extensions", "pi-lens"));
+	if (p) return p;
+
+	return undefined;
+}
+
 export function hasOxfmtConfig(cwd: string): boolean {
 	for (const dir of walkUpDirs(cwd)) {
 		if (fs.existsSync(path.join(dir, "oxfmt.toml"))) return true;
@@ -2286,13 +2375,16 @@ export function ruffConfigArgs(cwd: string): string[] {
 /**
  * Shared config-args seam for the biome lint AND autofix surfaces (#1247).
  * The lint runner (`biome-check.ts`) and `biomeClient.fixFileAsync` MUST both
- * consume this builder so the user's `biome.json(c)` — or the package-owned
- * `config/biome/core.jsonc` fallback — applies on `lint --write` too.
+ * consume this builder so the resolved config — project, project-scoped `.pi`,
+ * or global `~/.pi` — or the package-owned `config/biome/core.jsonc` fallback —
+ * applies on `lint --write` too.
  */
 export function biomeConfigArgs(cwd: string): string[] {
+	// `findNearestMarkerRoot` never resolves at/above $HOME, so the
+	// project-internal layer cannot escape the user's workspace.
 	return [
 		"--config-path=" +
-			(getBiomeConfigPath(cwd) ??
+			(resolveBiomeConfigPath(cwd) ??
 				resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
 	];
 }

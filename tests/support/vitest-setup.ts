@@ -30,6 +30,13 @@ process.env.PI_LENS_MAX_LOG_SIZE_MB = "10";
 // themselves (loadPiLensGlobalConfig takes an explicit path parameter too).
 process.env.PI_LENS_CONFIG_PATH = "/nonexistent-pi-lens-tests/config.json";
 
+// Hermeticity (same class as PI_LENS_CONFIG_PATH): `resolveBiomeConfigPath`
+// consults a machine-wide `~/.pi/.extensions/pi-lens/biome.json(c)` as its
+// global fallback layer. Point the override at a path that never exists so a
+// developer's personal biome config can't leak into test assertions; tests
+// that exercise the global layer pass `userDir` / set this explicitly.
+process.env.PI_LENS_USER_CONFIG_DIR = "/nonexistent-pi-lens-tests/user";
+
 // Hermeticity (#525, same class as #515 above): never let a test write into
 // the developer's REAL machine-global ~/.pi-lens (instances.json, logs,
 // probe-cache.json, managed tool/bin dirs, ...). Dogfooded live 2026-07-11: a
