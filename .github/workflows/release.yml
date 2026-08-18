@@ -1,8 +1,16 @@
 name: Release
 
+# Release is triggered by pushing a version tag (`vX.Y.Z`), not by every push
+# to master. Pushing a plain commit to master used to fire this workflow and
+# fail the changelog-rollup guard (that guard is only meaningful on the release
+# path); version tags are the only push event that should publish.
+#
+#   - push a `v*` tag  → publish (VERSION from the tag; cannot be skipped)
+#   - manual dispatch  → publish only if that package.json version is untagged
+#
 on:
   push:
-    branches: [master]
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
@@ -29,16 +37,25 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          TAG="v$VERSION"
-
-          # Release if the version tag doesn't exist yet. The tag check is the
-          # sole guard — no need to also require package.json in the diff, which
-          # breaks when the version bump and changelog land in separate commits.
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            SHOULD_RELEASE=false
-          else
+          # Tag-triggered run: the version/tag come straight off the pushed
+          # tag (`vX.Y.Z` → tag `vX.Y.Z`, version `X.Y.Z`). This can never be
+          # "already released": the workflow only ran because this tag was just
+          # pushed, so SHOULD_RELEASE is always true.
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
             SHOULD_RELEASE=true
+          else
+            # Manual `workflow_dispatch`: keep the original tag-existence guard
+            # so a dispatch on an already-tagged version is a no-op instead of a
+            # duplicate publish.
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="v$VERSION"
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              SHOULD_RELEASE=false
+            else
+              SHOULD_RELEASE=true
+            fi
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
