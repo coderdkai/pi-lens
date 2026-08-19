@@ -54,6 +54,7 @@ import https from "node:https";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { writeFileAtomicAsync } from "../atomic-write.js";
 import { BoundedLruCache } from "../bounded-cache.js";
 import { isFullyQualified } from "../path-utils.js";
 import {
@@ -1340,6 +1341,29 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// CUE ships a single native binary per platform on GitHub releases;
+		// the LSP runs via `cue lsp serve`. Used as managedToolId by CueServer.
+		id: "cue",
+		name: "CUE",
+		checkCommand: "cue",
+		checkArgs: ["version"],
+		installStrategy: "github",
+		binaryName: "cue",
+		github: {
+			repo: "cue-lang/cue",
+			assetMatch: (platform, arch) => {
+				if (platform === "linux")
+					return arch === "arm64" ? "linux_arm64.tar.gz" : "linux_amd64.tar.gz";
+				if (platform === "darwin")
+					return arch === "arm64" ? "darwin_arm64.tar.gz" : "darwin_amd64.tar.gz";
+				if (platform === "win32")
+					return arch === "arm64" ? "windows_arm64.zip" : "windows_amd64.zip";
+				return undefined;
+			},
+			binaryInArchive: "cue",
+		},
+	},
+	{
 		// gleam ships a single static binary per platform on GitHub releases; the
 		// LSP runs via `gleam lsp`. Used as managedToolId by GleamServer. The linux
 		// build is a FLAT musl tarball (a bare `gleam`), handled by the recursive
@@ -1494,6 +1518,33 @@ export function getInstallAttempt(toolId: string): InstallAttempt | undefined {
 	return installAttempts.get(toolId);
 }
 
+/**
+ * How the last `ensureTool` call for `toolId` resolved a path WITHOUT
+ * recording an install attempt (#1636 review). `getInstallAttempt` answers
+ * "undefined" for three different situations that a compensating-row consumer
+ * must not collapse into one label:
+ *
+ *   * `"session-cache"` — the in-memory `resolvedPathCache` already held a
+ *     verified path (fast path 1).
+ *   * `"probe-cache"`   — the persistent on-disk probe cache answered without
+ *     a fresh spawn (fast path 2).
+ *   * `"path"`          — `getToolPath` found the binary this call, on PATH,
+ *     a package manager's global bin dir, or the managed tools dir — a plain
+ *     discovery, not a cache hit.
+ *
+ * Reset alongside `installAttempts` at the top of every `ensureToolResolved`
+ * call so a stale source never survives past the attempt it described.
+ */
+export type EnsureResolutionSource = "session-cache" | "probe-cache" | "path";
+
+const lastEnsureResolutionSource = new Map<string, EnsureResolutionSource>();
+
+export function getLastEnsureResolutionSource(
+	toolId: string,
+): EnsureResolutionSource | undefined {
+	return lastEnsureResolutionSource.get(toolId);
+}
+
 // Session-lifetime cache: once a tool path is resolved, skip the process-spawn check on subsequent calls.
 const resolvedPathCache = new BoundedLruCache<string, string>(256);
 
@@ -1610,13 +1661,32 @@ function snapshotProbeCacheChanges(): ProbeCacheFlushSnapshot {
 	};
 }
 
+/**
+ * Deserialize the on-disk probe-cache for the LOCKED write-side merge
+ * (`writeProbeCache`'s `commitDurableStoreAsync` call). Unlike `readProbeCache`
+ * (the ordinary session-lookup path, which already degrades a parse/shape
+ * failure to `{}`), this used to THROW on a torn/corrupt file — which does
+ * not crash the caller (`writeProbeCache` wraps the whole commit in try/catch
+ * and retries), but it also means the corrupt file on disk is never repaired:
+ * every retry re-reads the same torn bytes, re-throws, and gives up again,
+ * forever (#1609 layer b). Degrading here too, exactly like `readProbeCache`,
+ * lets the next successful flush's `merge` step overwrite the torn file with
+ * a valid one instead of looping on it indefinitely.
+ */
 function deserializeProbeCache(contents: string | undefined): ProbeCache {
 	if (contents === undefined) return {};
-	const parsed: unknown = JSON.parse(contents);
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		throw new Error("probe-cache root is not an object");
+	try {
+		const parsed: unknown = JSON.parse(contents);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("probe-cache root is not an object");
+		}
+		return parsed as ProbeCache;
+	} catch (err) {
+		logSessionStart(
+			`auto-install probe-cache: write-side read was corrupt (${(err as Error).message}); recovering as empty`,
+		);
+		return {};
 	}
-	return parsed as ProbeCache;
 }
 
 function applyProbeCacheChanges(
@@ -1858,6 +1928,7 @@ export function resetProbeCacheStateForTesting(): void {
 	ensureInFlight.clear();
 	installFailureReasons.clear();
 	installAttempts.clear();
+	lastEnsureResolutionSource.clear();
 	lastManagedInstallVersion.clear();
 	lastResolveTransient.clear();
 	resetPathWalkMemo();
@@ -2933,7 +3004,10 @@ async function installGitHubTool(
 				gunzip.on("error", reject);
 				gunzip.end(assetBuffer);
 			});
-			await fs.writeFile(destPath, decompressed, { mode: 0o750 });
+			await writeFileAtomicAsync(destPath, decompressed, {
+				bestEffort: false,
+				mode: 0o750,
+			});
 		} else if (assetName.endsWith(".tar.gz") || assetName.endsWith(".tar.xz")) {
 			// Write archive to temp file, extract with system tar
 			const tmpArchive = path.join(GITHUB_BIN_DIR, `_tmp_${assetName}`);
@@ -3032,7 +3106,10 @@ async function installGitHubTool(
 			if (!isWindows) await fs.chmod(destPath, 0o750);
 		} else {
 			// Bare binary (e.g. shfmt_*_linux_amd64)
-			await fs.writeFile(destPath, assetBuffer, { mode: 0o750 });
+			await writeFileAtomicAsync(destPath, assetBuffer, {
+				bestEffort: false,
+				mode: 0o750,
+			});
 		}
 	} catch (err) {
 		logSessionStart(
@@ -3054,9 +3131,11 @@ async function installGitHubTool(
 		}
 		try {
 			const extraBuffer = await httpsGet(extraAsset.browser_download_url);
-			await fs.writeFile(path.join(GITHUB_BIN_DIR, extraName), extraBuffer, {
-				mode: 0o750,
-			});
+			await writeFileAtomicAsync(
+				path.join(GITHUB_BIN_DIR, extraName),
+				extraBuffer,
+				{ bestEffort: false, mode: 0o750 },
+			);
 			logSessionStart(
 				`github-install ${tool.id}: installed extra asset ${extraName} (${extraBuffer.length} bytes)`,
 			);
@@ -3154,21 +3233,22 @@ async function installMavenTool(
 	try {
 		await fs.mkdir(GITHUB_BIN_DIR, { recursive: true });
 		const jarPath = path.join(GITHUB_BIN_DIR, `${tool.id}.jar`);
-		await fs.writeFile(jarPath, jarBuffer);
+		await writeFileAtomicAsync(jarPath, jarBuffer, { bestEffort: false });
 
 		// Launcher so the tool resolves as a normal command in the managed bin.
 		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
 		const launcherPath = path.join(GITHUB_BIN_DIR, launcherName);
 		if (isWindows) {
-			await fs.writeFile(
+			await writeFileAtomicAsync(
 				launcherPath,
 				`@echo off\r\njava -jar "%~dp0${tool.id}.jar" %*\r\n`,
+				{ bestEffort: false },
 			);
 		} else {
-			await fs.writeFile(
+			await writeFileAtomicAsync(
 				launcherPath,
 				`#!/bin/sh\nexec java -jar "$(dirname "$0")/${tool.id}.jar" "$@"\n`,
-				{ mode: 0o750 },
+				{ bestEffort: false, mode: 0o750 },
 			);
 		}
 		logSessionStart(
@@ -3335,15 +3415,16 @@ async function installArchiveTool(
 		const launcherName = isWindows ? `${binaryName}.bat` : binaryName;
 		const shimPath = path.join(GITHUB_BIN_DIR, launcherName);
 		if (isWindows) {
-			await fs.writeFile(
+			await writeFileAtomicAsync(
 				shimPath,
 				`@echo off\r\ncall "${resolvedInner}" %*\r\n`,
+				{ bestEffort: false },
 			);
 		} else {
-			await fs.writeFile(
+			await writeFileAtomicAsync(
 				shimPath,
 				`#!/bin/sh\nexec "${resolvedInner}" "$@"\n`,
-				{ mode: 0o750 },
+				{ bestEffort: false, mode: 0o750 },
 			);
 		}
 		logSessionStart(
@@ -3373,9 +3454,10 @@ async function installNpmTool(
 		try {
 			await fs.access(packageJsonPath);
 		} catch {
-			await fs.writeFile(
+			await writeFileAtomicAsync(
 				packageJsonPath,
 				JSON.stringify({ name: "pi-lens-tools", version: "1.0.0" }, null, 2),
+				{ bestEffort: false },
 			);
 		}
 
@@ -3846,6 +3928,7 @@ async function ensureToolResolved(
 	// A fresh ensure supersedes whatever the last one recorded, and the trust-gate
 	// branch above deliberately keeps its `declined` record by never reaching here.
 	installAttempts.delete(toolId);
+	lastEnsureResolutionSource.delete(toolId);
 	const cacheResolvedPath = (result: string | undefined): string | undefined => {
 		if (result) {
 			resolvedPathCache.set(toolId, result);
@@ -3934,9 +4017,13 @@ async function ensureToolResolved(
 	// Fast path 1: in-memory session cache — no I/O.
 	const cached = resolvedPathCache.get(toolId);
 	if (cached) {
-		if (!isFullyQualified(cached)) return cached;
+		if (!isFullyQualified(cached)) {
+			lastEnsureResolutionSource.set(toolId, "session-cache");
+			return cached;
+		}
 		try {
 			await fs.access(cached);
+			lastEnsureResolutionSource.set(toolId, "session-cache");
 			return cached;
 		} catch {
 			// The executor would report ENOENT for this cached positive. Evict it
@@ -3955,6 +4042,7 @@ async function ensureToolResolved(
 	const diskCached = await checkProbeCache(toolId);
 	if (diskCached) {
 		resolvedPathCache.set(toolId, diskCached);
+		lastEnsureResolutionSource.set(toolId, "probe-cache");
 		logSessionStart(
 			`auto-install ensure ${toolId}: probe cache hit → ${diskCached}`,
 		);
@@ -4016,6 +4104,7 @@ async function ensureToolResolved(
 				existingPath,
 				wasLastResolveTransient(toolId),
 			);
+			lastEnsureResolutionSource.set(toolId, "path");
 			logSessionStart(
 				`auto-install ensure ${toolId}: already available at ${existingPath} (${Date.now() - ensureStartMs}ms)`,
 			);
@@ -4166,6 +4255,19 @@ export function isKnownToolId(toolId: string): boolean {
 }
 
 /**
+ * The registry's own install strategy for `toolId`, or `undefined` for an
+ * unknown id. Single source of truth for anything that needs to LABEL how a
+ * tool gets installed (e.g. the availability-decision evidence's `source`
+ * tag, #1612) — derived from the same `TOOLS` entry `ensureTool` dispatches
+ * on, so the label can never drift out of sync with the actual installer.
+ */
+export function getToolInstallStrategy(
+	toolId: string,
+): ToolDefinition["installStrategy"] | undefined {
+	return TOOLS.find((tool) => tool.id === toolId)?.installStrategy;
+}
+
+/**
  * GitHub-release tools that ship an asset for **every** supported
  * platform/arch combo (linux/darwin/win32 × x64/arm64). This is the set the
  * full asset-matrix test (tests/clients/installer/github-release.test.ts)
@@ -4198,6 +4300,7 @@ export const GITHUB_TOOLS = [
 	"opengrep",
 	"deno",
 	"clojure-lsp",
+	"cue",
 	"gleam",
 	"marksman",
 	"expert",

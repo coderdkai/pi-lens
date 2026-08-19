@@ -42,6 +42,7 @@ import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { loadLspService } from "./lsp-lazy.js";
 import type { MetricsClient } from "./metrics-client.js";
 import type { OpengrepClient, OpengrepResult } from "./opengrep-client.js";
+import { _resetPackageManagerCache } from "./package-manager.js";
 import { isAtOrAboveHomeDir } from "./path-utils.js";
 import { isPrintMode } from "./print-mode.js";
 import {
@@ -1868,6 +1869,12 @@ export async function handleSessionStart(
 	// from `clearFormatterRuntimeState()`, which runs every turn, so a failing
 	// install re-spawned every turn instead of once per session.
 	resetLazyInstallAttempts();
+	// #1653: pnpm/yarn/bun/npm's availability latches (package-manager.ts) are
+	// module-local, same #1490/#1535 shape as the two lines above — the
+	// generation counter above does not reach them. Without this line, a
+	// pnpm/yarn/bun install done mid-day stayed invisible: a genuine "missing"
+	// verdict from one session latched into the next until a process restart.
+	_resetPackageManagerCache();
 	// #1123 item 3: a fresh session can re-report smells that a prior session
 	// already surfaced once (see `checkSmellsAndNoteOnce`'s once-per-session gate).
 	resetSmellsSessionState();
@@ -1928,11 +1935,21 @@ export async function handleSessionStart(
 	// project data roots and machine-global registry root once per session start;
 	// this is fire-and-forget and bounded so it never delays startup.
 	const projectDataDir = getProjectDataDir(cwd);
+	// #1609 review F1: sweepOwnStagingFiles does not recurse, so the installer's
+	// bin/ and tools/ subdirectories (clients/installer/index.ts's
+	// GITHUB_BIN_DIR / TOOLS_DIR, now atomic-write.js writers too) need their
+	// own entries — otherwise an orphaned staging file from a kill mid-install
+	// (this PR's own motivating scenario) never gets reaped, and unique
+	// pid-thread-seq staging names mean repeated kills ACCUMULATE full-size
+	// orphan binaries instead of being cleaned up.
+	const globalDir = getGlobalPiLensDir();
 	void sweepAtomicWriteStages([
 		projectDataDir,
 		path.join(projectDataDir, "cache"),
 		path.join(projectDataDir, "sessions"),
-		getGlobalPiLensDir(),
+		globalDir,
+		path.join(globalDir, "bin"),
+		path.join(globalDir, "tools"),
 	]).catch(() => {
 		// best-effort lifecycle cleanup — never fail session_start
 	});

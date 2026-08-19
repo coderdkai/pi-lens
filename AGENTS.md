@@ -138,6 +138,36 @@ its findings ride along. And an inconclusive touch must name its cause
 `diagnostics-wait` / `mixed`) on the result, in `lsp_touch_file`, and in the
 cascade's `neighbor_touch` row. (#1549)
 
+**Content-bound coverage is ONE rule, evaluated ONCE, at the merge.**
+`auxCoversThisContent` (`clients/lsp/index.ts`, inside `touchFile`) is that rule
+— the pre-notify `auxPublishedThisContent` snapshot unioned with a live
+`getDiagnosticBinding` read, both asking `bindingMatchesTouchContent`, the only
+place `touchContentHash` is compared. `auxCoveredAtMerge` freezes it as the last
+statement before the merge, and every door that shares the merge's consequences
+reads that SET, never the function: the merge drop, the deferred door, the
+merged BINDING (a dropped contributor loses its findings and its fingerprint
+together), and the result's `unconfirmedServerIds`. The two aux wait-outcome
+producers still call the function, because their rows describe their own instant;
+their verdict is reconciled against the freeze before anything is claimed.
+
+Both timing errors are live defects, and they point opposite ways. Asking
+EARLIER than the decision underclaims: #1549 put the notify-write door on the
+merge-time read but left the DEFERRED door on the pre-notify snapshot, which
+cannot see a write that lands after it, so a scanner that had published for
+exactly these bytes while its resync sat queued was dropped and named (#1586).
+Asking LATER overclaims, and that is the worse one: `touchFile` awaits after the
+merge (`brokenSkippedAuxiliaryServerIds` on every collecting touch, the tsserver
+sync and liveness gates on theirs), so re-asking when the gap is named let a
+publication landing in that window un-name a scanner whose findings the merge had
+ALREADY dropped — `confirmed` over a `.diags` that is missing the scanner's
+answer, which unblocks the `lastKnownDiagnostics` prime and the
+`demonstratedReady` mark that `coverageGap` exists to hold shut. A drop is an
+action; a later answer cannot undo it. The screen when you add a door: ask the
+rule where the decision is made, never earlier and never later, and if your door
+acts on the answer, read the freeze. The `lsp_notify_resync_deferred` row keeps
+recording the gate's action either way; the coverage fields report only what the
+touch is actually uncovered for. (#1586)
+
 A deferred cascade result that arrives LATE — past the turn-end settle cap, or
 in the quiet window after the turn already consumed its runs — must still reach
 the agent. `turnSeq` is not a staleness signal for such a run (a late run is by
@@ -316,6 +346,8 @@ This is the payoff of the two disciplines above: a bounded checklist of defect *
 13. **A transient failure classified as durable INSIDE an already-governed latch.** Migrating a memo to the shared availability policy makes its *storage* correct and says nothing about its *classification*. `govulncheck-client.ts` wrote `this.available = false` after a failed `go install`, and that setter routes into `availabilityLatch.noteUnavailable("missing", "not-found")` — governed plumbing, wrong classification, and the resulting `availability_decision` row is a well-formed `missing` verdict indistinguishable from a genuine absence. *Screen:* when a call site hands the policy an outcome it did NOT derive from `classifyProbeFailure`, justify it in a comment at the call site AND record what actually failed — `classifiedBy: "caller"` plus `evidence` (`clients/dispatch/runners/utils/availability-policy.ts`), so the row can be audited instead of trusted. An install failure, a stat, or a shim on disk are all legitimate caller assertions; a spawn result is not — derive it. *e.g.* #1500 (the class), #1467/#1476/#1489 (the migrations that made storage correct). *Detect:* **deliberately ungated.** The available shortcut — flag any literal `"missing"`/`"not-found"` passed into a governed latch — fires on every correct post-ENOENT write, and a gate that cries wolf gets baselined rather than fixed. Review-enforced: grep `noteUnavailable(`/`available = false` and ask what spawn result justified each one.
 
 14. **A test that resets a DUPLICATE of the module's state.** Vitest resolves an import specifier literally, and this repo's runtime is the compiled output, so `x.ts` and `x.js` are two module instances: the `.ts` spelling gives the test a private copy of that module's own mutable state (generation counters, latches, memo maps) while everything the module imports stays shared. A `beforeEach` reset called through `.ts` therefore clears the copy, the code under test keeps reading the compiled original, and the assertion passes without ever observing the state it claims to guard — shape 7 with no visible fixture defect to notice. Note the trap in the ordinary case too: a test whose imports are ALL `.ts` is accidentally self-consistent and green, so "it passes" says nothing; one co-imported `.js` module reaching the same file makes it vacuous. *Screen:* tests import the artifact the runtime imports — `.js` — for every module the build compiles, including `vi.mock` and dynamic-`import()` specifiers. *e.g.* #1514 (the near-miss: the fixer's session-re-arm test only bound after switching its imports to `.js`), #1565 (the class; 17 test files were reaching the same module both ways). *Detect:* `tests/config/module-instance-coverage.test.ts` — a static scan (`tests/support/module-instance-scan.ts`) over every specifier in `tests/`, with a reasoned allowlist. Static on purpose: a twin-on-disk check goes silent in an unbuilt tree.
+
+15. **A detached process-lifetime timer firing into an operation that granted itself a longer wall-clock budget than the timer's own delay.** A 240s LSP idle-reset timer (`clients/runtime-turn.ts`) fired straight into an in-flight `lens_diagnostics mode=full` sweep (which grants itself 300s), destroying the very service the sweep was touching and mislabeling ~81 service-destroyed files as budget exhaustion. *Screen:* when a background timer and a long-running operation can both touch the same resource, the operation must HOLD a gate for its whole lifetime (a counter, not a boolean — an overlapping second call or a throw must still release correctly via try/finally), and the timer must check that gate at FIRE time and defer — re-arming a FRESH delay once the gate releases, never resuming a countdown that already elapsed. Derive the timer's delay from the operation's own ceiling plus a safety margin so the two constants can't drift back into the dangerous relationship; extend the derivation to every path that arms the SAME timer (a shortened/degraded-mode delay is not exempt just because it's usually smaller). A destroyed-mid-operation outcome needs its OWN discriminated reason, distinct from a real timeout or a thrown error — collapsing them into one ambiguous flag reproduces shape 10 (silencing/misclassifying counted as fixing) one level up. And the hold itself is state that must re-arm at session_start (clear it unconditionally on a session boundary) and carry a bounded max-age failsafe (force-release past the operation's own ceiling, with a distinct log record) — a leaked hold that never releases is the INVERSE defect, permanently disabling the timer. *e.g.* #1618 (`clients/lsp/workspace-sweep-hold.ts`'s counter-based hold, `LSPWorkspaceDiagnosticResult.unconfirmedReason`). *Detect:* review question — can a background timer and a long operation touch the same resource, and does anything gate the timer on the operation's actual lifetime rather than a guessed delay? Not ast-grep-able (the racing pair is never syntactically adjacent).
 
 ### AI-authorship smells
 
@@ -1135,6 +1167,8 @@ Tracks modified file ranges per turn for turn_end targeting, bumps project/file 
 
 **`turn_end`** → `handleTurnEnd` (`clients/runtime-turn.ts`)
 First **settles** the turn's deferred cascade computes with a bounded wait (`settleCascadeRuns`, cap via `PI_LENS_CASCADE_SETTLE_WAIT_MS`, default 5000ms; a late compute is carried over to the next turn_end rather than lost), then merges unresolved inline blockers and cascade findings, writes latest-turn actionable/code-quality warning reports with sequence metadata, runs Knip delta analysis when the startup scan is not in flight, runs Madge circular-dependency checks for files whose imports changed, and fires related/failed tests asynchronously for the next context injection. Reads the session-scan caches and surfaces them. **Secrets** (`gitleaks` + `trivy secret` + the ast-grep `*-hardcoded-secret-*` rules) are collapsed **by location** via `clients/secret-findings.ts` (`dedupeSecretFindings`) into a single 🔴 blocker with combined provenance (`[gitleaks + trivy + ast-grep]`) — the rule-keyed diagnostic dedup can't merge them since each source uses a different rule id; the duplicate ast-grep advisory copy is suppressed from the actionable-warnings report at the blocked locations (#131 Mode 3). Trivy **CRITICAL** CVEs are 🔴 blockers ("upgrade before shipping"); `govulncheck`/Trivy non-critical CVEs are advisories (FixedVersion as an upgrade hint — never auto-edits lockfiles). Trivy **license risk** (copyleft/restricted licenses, #131 Mode 4) is a 📜 advisory from the same `trivy fs --scanners vuln,secret,license` pass. Deduplicates findings against previous turn state and injects blockers (🔴) and advisories into the agent's context.
+
+Deferred cascades must not charge write-to-`turn_end` time against the `turn_end` settle budget. `runtime-coordinator` exposes the active `turn_end` settle start; `runtime-turn` enables it, and quiet-window carry-over does not. Transitive-impact `truncated` means partial coverage even when the final file slice fits, so `cascade_result.transitiveTruncated` and `CascadeBudgetCoverage.transitiveTruncated` are lower-bound evidence, not an exact omitted count; `truncated` is true only when an additional eligible edge is found beyond the hit cap, so an exact-cap traversal is complete; mixed cascades replay passive findings only for selected no-LSP candidates, while all-no-data runs retain broad fallback.
 
 ## Key abstractions
 
