@@ -2000,14 +2000,14 @@ export function findBiomeProjectRoot(cwd: string): string | null {
  *    `cwd`, bounded by the repo's `.git` so a monorepo sub-package finds the
  *    root config but a search never escapes the repo (or $HOME) to pick up an
  *    unrelated parent's config.
- * 2. Project-scoped personal config — `{projectRoot}/.pi/.extensions/pi-lens/`.
+ * 2. Project-scoped personal config — `{projectRoot}/.pi/agent/extensions/pi-lens/`.
  *    Shipped in-repo but kept separate from tracked `biome.json`. The user can
  *    opt a whole repo's `.pi` into the style canon without per-dir overrides.
- * 3. Global personal config — `~/.pi/.extensions/pi-lens/` (machine-wide biome
- *    preferences). The base is hardcoded to `~/.pi` and can be overridden via
- *    `PI_LENS_USER_CONFIG_DIR` (used by tests to stay hermetic; the env var
+ * 3. Global personal config — `~/.pi/agent/extensions/pi-lens/` (machine-wide
+ *    biome preferences). The base is hardcoded to `~/.pi` and can be overridden
+ *    via `PI_LENS_USER_CONFIG_DIR` (used by tests to stay hermetic; the env var
  *    replaces the home prefix, so `PI_LENS_USER_CONFIG_DIR=/x` resolves
- *    `/x/.extensions/pi-lens/`).
+ *    `/x/agent/extensions/pi-lens/`).
  * 4. Internal fallback — the package-owned `config/biome/core.jsonc`, applied
  *    by `biomeConfigArgs` when this returns `undefined`.
  *
@@ -2033,7 +2033,7 @@ export function resolveBiomeConfigPath(
 	const projectRoot = findBiomeProjectRoot(cwd);
 	if (projectRoot) {
 		const p = firstBiomeConfigIn(
-			path.join(projectRoot, ".pi", ".extensions", "pi-lens"),
+			path.join(projectRoot, ".pi", "agent", "extensions", "pi-lens"),
 		);
 		if (p) return p;
 	}
@@ -2043,7 +2043,9 @@ export function resolveBiomeConfigPath(
 		opts.userDir ??
 		process.env.PI_LENS_USER_CONFIG_DIR ??
 		path.join(os.homedir(), ".pi");
-	const p = firstBiomeConfigIn(path.join(userDir, ".extensions", "pi-lens"));
+	const p = firstBiomeConfigIn(
+		path.join(userDir, "agent", "extensions", "pi-lens"),
+	);
 	if (p) return p;
 
 	return undefined;

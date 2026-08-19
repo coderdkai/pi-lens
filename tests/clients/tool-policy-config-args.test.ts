@@ -135,7 +135,8 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			const piCfg = path.join(
 				root,
 				".pi",
-				".extensions",
+				"agent",
+				"extensions",
 				"pi-lens",
 				"biome.json",
 			);
@@ -150,7 +151,8 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			const userDir = path.join(tmpDir, "user-home");
 			const globalCfg = path.join(
 				userDir,
-				".extensions",
+				"agent",
+				"extensions",
 				"pi-lens",
 				"biome.jsonc",
 			);
@@ -166,7 +168,8 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			const piCfg = path.join(
 				root,
 				".pi",
-				".extensions",
+				"agent",
+				"extensions",
 				"pi-lens",
 				"biome.json",
 			);
@@ -175,7 +178,8 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			const globalCfg = path.join(
 				tmpDir,
 				"glob",
-				".extensions",
+				"agent",
+				"extensions",
 				"pi-lens",
 				"biome.json",
 			);
