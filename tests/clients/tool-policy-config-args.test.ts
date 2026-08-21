@@ -86,12 +86,17 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			]);
 		});
 
-		it("prefers the user's biome.json over the package fallback", () => {
+		// #1731 discipline A: `--config-path` pins biome's config resolution to
+		// ONE file, so passing it even when the project ships its own
+		// `biome.json` blocked biome's own nested-config resolution (a
+		// monorepo package under `cwd` with its own `biome.json` could never
+		// extend/override the root config). No flag at all lets biome discover
+		// it unaided — the same "omit the flag" shape `ruffConfigArgs` and
+		// `markdownlintConfigArgs` already use above.
+		it("passes no flag at all when the project ships its own biome.json (#1731)", () => {
 			const userConfig = path.join(tmpDir, "biome.json");
 			fs.writeFileSync(userConfig, "{}");
-			expect(biomeConfigArgs(tmpDir)).toEqual([
-				`--config-path=${userConfig}`,
-			]);
+			expect(biomeConfigArgs(tmpDir)).toEqual([]);
 		});
 	});
 
@@ -195,12 +200,45 @@ describe("shared lint/autofix config-args builders (#1247)", () => {
 			expect(findBiomeProjectRoot(nested)).toBe(root);
 		});
 
-		it("findBiomeProjectRoot falls back to the nearest package.json for non-git dirs", () => {
-			const root = path.join(tmpDir, "nongit");
-			const nested = path.join(root, "pkg");
-			fs.mkdirSync(nested, { recursive: true });
-			fs.writeFileSync(path.join(root, "package.json"), "{}");
-			expect(findBiomeProjectRoot(nested)).toBe(root);
+		it("passes --config-path when a project-scoped .pi config is resolved", () => {
+			const { root, nested } = makeRepo("r-pi");
+			const piCfg = path.join(
+				root,
+				".pi",
+				"agent",
+				"extensions",
+				"pi-lens",
+				"biome.json",
+			);
+			fs.mkdirSync(path.dirname(piCfg), { recursive: true });
+			fs.writeFileSync(piCfg, "{}");
+			expect(biomeConfigArgs(nested)).toEqual([`--config-path=${piCfg}`]);
+		});
+
+		it("passes --config-path when a global ~/.pi config is resolved", () => {
+			const { nested } = makeRepo("r-glob");
+			const userDir = path.join(tmpDir, "user-home-args");
+			const globalCfg = path.join(
+				userDir,
+				"agent",
+				"extensions",
+				"pi-lens",
+				"biome.jsonc",
+			);
+			fs.mkdirSync(path.dirname(globalCfg), { recursive: true });
+			fs.writeFileSync(globalCfg, "{}");
+
+			const prevEnv = process.env.PI_LENS_USER_CONFIG_DIR;
+			process.env.PI_LENS_USER_CONFIG_DIR = userDir;
+			try {
+				expect(biomeConfigArgs(nested)).toEqual([`--config-path=${globalCfg}`]);
+			} finally {
+				if (prevEnv !== undefined) {
+					process.env.PI_LENS_USER_CONFIG_DIR = prevEnv;
+				} else {
+					delete process.env.PI_LENS_USER_CONFIG_DIR;
+				}
+			}
 		});
 	});
 });

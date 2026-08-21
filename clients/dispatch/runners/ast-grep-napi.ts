@@ -363,11 +363,21 @@ export function canHandle(filePath: string): boolean {
  * file. Without this, `language:` reads as a real filter but isn't one for
  * ts↔js pairs, so twin rules sharing a base name (e.g. `hardcoded-url` /
  * `hardcoded-url-js`) both match the same construct in the SAME runner
- * invocation (#657). TSX is deliberately its own grammar here: the primary
- * ast-grep CLI/LSP also treats `tsx` as distinct from `typescript`, so a
- * language-tagged rule only runs on the exact grammar it names. Returns
- * undefined for extensions this scoping doesn't apply to (css/html), where
- * no filtering is added.
+ * invocation (#657). TSX is its own grammar here too — the primary
+ * ast-grep CLI/LSP also treats `tsx` as distinct from `typescript` — but
+ * the caller's language-match check adds ONE deliberate exception on top
+ * of the exact-match rule: a `TypeScript`-tagged rule also runs against
+ * a `.tsx` file's fileLang (#1608). This is grounded empirically, not by
+ * analogy — tsx's grammar is a syntactic superset of typescript's for
+ * every construct the shipped catalog's rules target (JSX productions
+ * added, plus the removal of the `<T>expr` cast form, which cannot
+ * appear in valid `.tsx` source), and every `language: TypeScript`
+ * rule's fixture-test `invalid:` snippet is asserted to still match
+ * parsed as tsx (ast-grep-tsx-coverage.test.ts) rather than assumed.
+ * Without this exception the entire TS ruleset silently never runs on
+ * `.tsx` files. `TSX`-tagged rules stay `.tsx`-exclusive; the exception
+ * is TS→TSX only. Returns undefined for extensions this scoping doesn't
+ * apply to (css/html), where no filtering is added.
  */
 export function ruleLanguageForFile(
 	filePath: string,
@@ -471,6 +481,33 @@ function appendDuplicateRuleDiagnostics(
 		if (diagnostics.length >= maxTotalDiagnostics) return true;
 	}
 	return false;
+}
+
+/**
+ * The four tiers `Diagnostic.severity` accepts (clients/dispatch/types.ts).
+ * `YamlRule.severity` is a free-form string straight off disk, so an unknown
+ * or missing value must land somewhere deliberate rather than being cast.
+ */
+const DIAGNOSTIC_SEVERITY_TIERS = new Set<Diagnostic["severity"]>([
+	"error",
+	"warning",
+	"info",
+	"hint",
+]);
+
+/**
+ * Map a rule's declared YAML severity onto a `Diagnostic.severity` tier (#1777).
+ *
+ * A rule that declares nothing, or declares a value pi-lens does not model
+ * (ast-grep also accepts `off`), falls back to `warning` — the tier every such
+ * rule already reported at before #1777, so reviving hint/info never silently
+ * demotes an existing rule.
+ */
+export function normalizeRuleSeverity(
+	raw: string | undefined,
+): Diagnostic["severity"] {
+	const tier = raw as Diagnostic["severity"] | undefined;
+	return tier && DIAGNOSTIC_SEVERITY_TIERS.has(tier) ? tier : "warning";
 }
 
 /**
@@ -616,9 +653,27 @@ export function evaluateAstGrepRules(
 			}
 			// Scope TypeScript/JavaScript-tagged rules to the file's actual
 			// grammar (#657) — otherwise a `-js` twin sharing generic node
-			// kinds with its TS sibling double-fires on every .ts file.
+			// kinds with its TS sibling double-fires on every .ts file. TSX
+			// is the one deliberate exception (#1608): the tsx grammar is a
+			// syntactic superset of typescript's for every non-JSX construct
+			// (the `<T>expr` cast form is the only TS-only production, and
+			// it can't appear in valid .tsx source anyway), so a
+			// `language: TypeScript` rule still matches a tsx-parsed root
+			// and must run there too, or the entire TS ruleset (120 of 263
+			// rules) goes dark on every .tsx file. `language: TSX` rules
+			// stay tsx-exclusive — they're already scoped to fileLang
+			// "tsx" by the exact-match check.
 			if (lang && fileLang && lang !== fileLang) {
-				continue;
+				const runsAsTsOnTsx = fileLang === "tsx" && lang === "typescript";
+				if (!runsAsTsOnTsx) {
+					const key = `mismatch:${lang}->${fileLang}`;
+					if (!unsupportedLanguageLog.has(key)) {
+						const ids = newlyUnsupported.get(key) ?? [];
+						ids.push(rule.id);
+						newlyUnsupported.set(key, ids);
+					}
+					continue;
+				}
 			}
 
 			if (blockingOnly && rule.rule) {
@@ -668,7 +723,14 @@ export function evaluateAstGrepRules(
 						range(): { start: { line: number; column: number } };
 					};
 					const range = node.range();
-					const severity = rule.severity === "error" ? "error" : "warning";
+					// #1777: carry the rule's own tier through. The old collapse
+					// (`=== "error" ? "error" : "warning"`) erased hint and info,
+					// so the quiet tier the #1727 anti-slop rules ship at did not
+					// exist anywhere downstream. `Diagnostic.severity` has been
+					// 4-valued all along (clients/dispatch/types.ts). The BLOCKING
+					// gate is unchanged and deliberately narrower: only `error`
+					// blocks, so hint and info stay advisory exactly like warning.
+					const severity = normalizeRuleSeverity(rule.severity);
 					const semantic = severity === "error" ? "blocking" : "warning";
 					const defectClass = classifyDefect(
 						rule.id,

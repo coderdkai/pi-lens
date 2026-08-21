@@ -6,6 +6,10 @@ import { readChangesSince } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import {
+	getVerifiedPathAttributionGuessCount,
+	resetVerifiedPathAttributionGuessCount,
+} from "../../clients/path-attribution-telemetry.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
 const logLatency = vi.hoisted(() => vi.fn());
@@ -14,6 +18,9 @@ vi.mock("../../clients/latency-logger.js", () => ({ logLatency }));
 vi.mock("../../clients/pipeline.js", () => ({
 	runPipeline: vi.fn(),
 }));
+
+const notifyExternalFileChange = vi.hoisted(() => vi.fn(async () => undefined));
+vi.mock("../../clients/lsp/index.js", () => ({ notifyExternalFileChange }));
 
 describe("bash grep searchReads registration", () => {
 	it("registers bash reads only from a successful tool result", async () => {
@@ -125,13 +132,248 @@ describe("bash grep searchReads registration", () => {
 				readGuard: { recordRead },
 			} as any);
 
+			// #1904 item 2: a bare `grep -n` shows ONE line, so credit one line.
+			expect(recordRead).toHaveBeenCalledWith(
+				expect.objectContaining({
+					filePath,
+					effectiveOffset: 9,
+					effectiveLimit: 1,
+					searchCredit: {
+						marginBefore: 0,
+						marginAfter: 0,
+						reason: "match-lines-only",
+					},
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("credits the context lines a grep -C actually printed", async () => {
+		const env = setupTestEnvironment("pi-lens-grep-context-credit-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			const sampleLines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`);
+			fs.writeFileSync(filePath, sampleLines.join("\n"));
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.beginTurn();
+			const recordRead = vi.fn();
+
+			await handleToolResult({
+				event: {
+					toolName: "bash",
+					input: { command: `grep -n -C2 line9 ${filePath}` },
+					details: {},
+					content: [{ type: "text", text: "9:line9" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				testRunnerClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: { recordRead },
+			} as any);
+
 			expect(recordRead).toHaveBeenCalledWith(
 				expect.objectContaining({
 					filePath,
 					effectiveOffset: 7,
 					effectiveLimit: 5,
+					searchCredit: {
+						marginBefore: 2,
+						marginAfter: 2,
+						reason: "delivered-context-flags",
+					},
 				}),
 			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("bash external-delete detection (#1668)", () => {
+	beforeEach(() => {
+		notifyExternalFileChange.mockClear();
+	});
+
+	function makeBase(env: { tmpDir: string }, readGuardOverrides: Record<string, unknown> = {}) {
+		return {
+			getFlag: () => false,
+			dbg: () => {},
+			runtime: Object.assign(new RuntimeCoordinator(), {
+				projectRoot: env.tmpDir,
+			}),
+			cacheManager: new CacheManager(false),
+			biomeClient: {},
+			ruffClient: {},
+			metricsClient: {},
+			resetLSPService: () => {},
+			agentBehaviorRecord: () => [],
+			formatBehaviorWarnings: () => "",
+			readGuard: {
+				recordRead: vi.fn(),
+				recordWritten: vi.fn(),
+				hasKnownPath: vi.fn(() => true),
+				forgetPath: vi.fn(),
+				...readGuardOverrides,
+			},
+		} as any;
+	}
+
+	it("a known path that is actually gone after `rm` gets a type-3 notify and is forgotten", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-known-");
+		try {
+			const filePath = path.join(env.tmpDir, "gone.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			const base = makeBase(env);
+
+			// Simulate the delete actually landing on disk (the command itself
+			// isn't executed by this test — handleToolResult only parses it).
+			fs.rmSync(filePath);
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `rm ${filePath}` },
+					content: [{ type: "text", text: "" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).toHaveBeenCalledTimes(1);
+			expect(notifyExternalFileChange).toHaveBeenCalledWith(filePath, 3);
+			expect(base.readGuard.forgetPath).toHaveBeenCalledWith(filePath);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a path pi-lens never knew about is NOT notified even if it's gone", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-unknown-");
+		try {
+			const filePath = path.join(env.tmpDir, "gone.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			fs.rmSync(filePath);
+			const base = makeBase(env, { hasKnownPath: vi.fn(() => false) });
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `rm ${filePath}` },
+					content: [{ type: "text", text: "" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).not.toHaveBeenCalled();
+			expect(base.readGuard.forgetPath).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a known path that still exists (rm failed / no-op) is NOT notified", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-noop-");
+		try {
+			const filePath = path.join(env.tmpDir, "still-here.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			const base = makeBase(env);
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `rm ${filePath}` },
+					content: [{ type: "text", text: "" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a failed bash tool result is NOT treated as a real delete", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-failed-");
+		try {
+			const filePath = path.join(env.tmpDir, "gone.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			fs.rmSync(filePath);
+			const base = makeBase(env);
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					isError: true,
+					input: { command: `rm ${filePath}` },
+					content: [{ type: "text", text: "rm: permission denied" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("a burst of deletes in one command notifies once per confirmed-gone known file", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-burst-");
+		try {
+			const files = ["a.ts", "b.ts", "c.ts"].map((name) =>
+				path.join(env.tmpDir, name),
+			);
+			for (const f of files) fs.writeFileSync(f, "export const x = 1;\n");
+			for (const f of files) fs.rmSync(f);
+			const base = makeBase(env);
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `rm ${files.join(" ")}` },
+					content: [{ type: "text", text: "" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).toHaveBeenCalledTimes(files.length);
+			for (const f of files) {
+				expect(notifyExternalFileChange).toHaveBeenCalledWith(f, 3);
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("respects --no-lsp: no external-delete notification is sent", async () => {
+		const env = setupTestEnvironment("pi-lens-bash-rm-no-lsp-");
+		try {
+			const filePath = path.join(env.tmpDir, "gone.ts");
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			fs.rmSync(filePath);
+			const base = makeBase(env);
+			base.getFlag = (name: string) => name === "no-lsp";
+
+			await handleToolResult({
+				...base,
+				event: {
+					toolName: "bash",
+					input: { command: `rm ${filePath}` },
+					content: [{ type: "text", text: "" }],
+				},
+			});
+
+			expect(notifyExternalFileChange).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();
 		}
@@ -475,8 +717,15 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {}, ruffClient: {}, metricsClient: {}, resetLSPService: () => {},
 				agentBehaviorRecord: () => [], formatBehaviorWarnings: () => "",
 			} as any);
-			expect(returned?.content.at(-1)?.text).toContain(fs.readFileSync(filePath, "utf-8"));
-			expect(returned?.content.at(-1)?.text).toContain("authoritative");
+			// #1590: the attachment block carries the bytes and the trailing
+			// notice block states the authority — one sentence, one author.
+			const attachment = returned?.content.find((part) =>
+				part.text?.startsWith("pi-lens applied autofix to"),
+			);
+			expect(attachment?.text).toContain(fs.readFileSync(filePath, "utf-8"));
+			expect(returned?.content.at(-1)?.text).toContain(
+				"is authoritative after autofix",
+			);
 		} finally { env.cleanup(); }
 	});
 
@@ -1601,7 +1850,7 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 			// path here is ambiguous: guessing the project root as the basis is
 			// exactly the #1642 collapse. This must fail CLOSED, not silently
 			// fall back to the old naive resolution.
-			createTempFile(env.tmpDir, "src/app.ts", "parent original\n");
+			resetVerifiedPathAttributionGuessCount();
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
 			const dbg = vi.fn();
@@ -1629,6 +1878,7 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 			expect(dbg).toHaveBeenCalledWith(
 				expect.stringContaining("path_attribution_missing"),
 			);
+			expect(getVerifiedPathAttributionGuessCount()).toBe(0);
 			expect(logLatency).toHaveBeenCalledWith(
 				expect.objectContaining({ phase: "path_attribution_missing" }),
 			);
@@ -1638,6 +1888,51 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 			} else {
 				process.env.PILENS_DATA_DIR = previousDataDir;
 			}
+			env.cleanup();
+		}
+	});
+
+	it("keeps a same-named workspace-root guess unverified without execution evidence (#1886)", async () => {
+		const env = setupTestEnvironment("pi-lens-attribution-verified-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			resetVerifiedPathAttributionGuessCount();
+			createTempFile(env.tmpDir, "src/app.ts", "parent original\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			await handleToolResult({
+				event: {
+					toolCallId: "call-verified-guess",
+					toolName: "edit",
+					input: { path: "src/app.ts" },
+					content: [{ type: "text", text: "base" }],
+				},
+				getFlag: () => false,
+				dbg: vi.fn(),
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			// A wrong-but-existing same-named file must not verify the guess.
+			// MUTATION PROOF: restoring existence-only verification makes both
+			// assertions fail because the tally increments and the full record is
+			// suppressed.
+			expect(getVerifiedPathAttributionGuessCount()).toBe(0);
+			expect(logLatency).toHaveBeenCalledWith(
+				expect.objectContaining({ phase: "path_attribution_missing" }),
+			);
+		} finally {
+			resetVerifiedPathAttributionGuessCount();
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
 			env.cleanup();
 		}
 	});

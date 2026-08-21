@@ -35,6 +35,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	_boundedTurnCountForTest,
+	admitBounded,
+	resetBoundedTelemetry,
+} from "../../clients/bounded-telemetry.js";
+import {
 	getDegradationSummary,
 	recordDegradationOnce,
 	resetDegradationLedger,
@@ -58,7 +63,24 @@ import {
 	createAvailabilityLatch,
 	resetInstallRetryLatches,
 } from "../../clients/dispatch/runners/utils/availability-policy.js";
+import {
+	managedToolRefreshesThisSession,
+	reserveManagedToolRefreshSlot,
+	resetManagedToolRefreshSession,
+} from "../../clients/installer/managed-tool-refresh-session.js";
+import {
+	getSharedTreeSitterClient,
+	resetTreeSitterClientLoadState,
+} from "../../clients/tree-sitter-shared.js";
+import {
+	resetWorkspaceDiagnosticsCacheSession,
+	workspaceDiagnosticsCacheSessionStart,
+} from "../../clients/lsp/workspace-diagnostics-session.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import {
+	consumeHostReadyDelayAnchor,
+	resetHostReadyDelayAnchorForTests,
+} from "../../clients/startup-timing.js";
 
 /**
  * When a piece of state must return to its initial value.
@@ -123,6 +145,25 @@ function scratchCwd(): string {
 }
 
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
+	// ── #1743 bounded-telemetry helper ───────────────────────────────
+	{
+		id: "bounded-telemetry:turnCounts",
+		module: "bounded-telemetry.ts",
+		state: "turnCounts, countedTurnIndex",
+		policy: "session_start",
+		resetName: "resetBoundedTelemetry",
+		reason:
+			"#1743: the per-turn admission counters are keyed by turn index, and a new session restarts turn numbering at 0, so without a session-boundary clear a count from the previous session's turn 0 would consume the new session's budget. The helper's rising-edge state is deliberately NOT here — it is the degradation ledger's own tally, reset one line above this one in handleSessionStart.",
+		probe: {
+			arm: () => {
+				admitBounded("loop_block", "session-state-registry-probe", {
+					capPerTurn: { limit: 1, turnIndex: 0 },
+				});
+			},
+			isArmed: () => _boundedTurnCountForTest("loop_block") === 0,
+			reset: () => resetBoundedTelemetry(),
+		},
+	},
 	// ── The named population from #1635 ──────────────────────────────────────
 	{
 		id: "degradation-ledger:onceKeys",
@@ -171,13 +212,13 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"#1615: the once-per-correction memo that suppresses repeat compensating rows is a per-session claim, so a new session must be able to log its own correction.",
 	},
 	{
-		id: "runner-helpers:availabilityStateGeneration",
+		id: "runner-helpers:availabilityGeneration",
 		module: "dispatch/runners/utils/runner-helpers.ts",
-		state: "availabilityStateGeneration",
+		state: "availabilityGeneration",
 		policy: "session_start",
 		resetName: "resetDispatchAvailabilityState",
 		reason:
-			"The generation counter is how every cwd-cached probe latch (eslint, clippy, and the rest of createCwdCachedProbe's users) re-arms without holding a reset closure per checker — one counter, not a parallel list of resets.",
+			"The generation counter is how every cwd-cached probe latch (eslint, clippy, and the rest of createCwdCachedProbe's users) re-arms without holding a reset closure per checker — one counter, not a parallel list of resets. #1754 made it a GenerationSource; resetDispatchAvailabilityState still owns the bump.",
 	},
 	{
 		id: "availability-policy:installRetryLatches",
@@ -200,6 +241,22 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			},
 			isArmed: () => probeLatch === undefined || !probeLatch.isInstallExhausted(),
 			reset: () => resetInstallRetryLatches(),
+		},
+	},
+	{
+		id: "managed-tool-refresh-session:refreshesThisSession",
+		module: "installer/managed-tool-refresh-session.ts",
+		state: "refreshesThisSession",
+		policy: "session_start",
+		resetName: "resetManagedToolRefreshSession",
+		reason:
+			"#1730: the managed-tool refresh budget is one `npm update` per SESSION; left process-lived, a long-running pi refreshes one tool at launch and never revisits the other 21. The weekly per-tool cadence is deliberately NOT reset here — it lives in the persisted stamp, so re-arming the budget only restores the session's right to ask.",
+		probe: {
+			arm: () => {
+				reserveManagedToolRefreshSlot(1);
+			},
+			isArmed: () => managedToolRefreshesThisSession() === 0,
+			reset: () => resetManagedToolRefreshSession(),
 		},
 	},
 	{
@@ -262,7 +319,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		id: "dispatch-integration:sessionCaches",
 		module: "dispatch/integration.ts",
 		state:
-			"cascadeDiagnosticBaselines, neighborTouchCache, recentlyCleanNeighborCache, primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
+			"cascadeDiagnosticBaselines, recentlyCleanNeighborCache, primaryFilesThisTurn, sessionSlopRuleCounts, sessionFacts",
 		policy: "session_start",
 		resetName: "resetDispatchBaselines",
 		reason:
@@ -276,6 +333,31 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "clearCoverageNoticeState",
 		reason:
 			"A once-per-session coverage notice must be sayable again to the next session's agent.",
+	},
+	{
+		id: "tree-sitter-shared:webTreeSitterLoadFailed",
+		module: "tree-sitter-shared.ts",
+		state:
+			"the shared TreeSitterClient singleton's webTreeSitterLoadFailed latch",
+		policy: "session_start",
+		resetName: "resetTreeSitterClientLoadState",
+		reason:
+			"#1592: an EVALUATION-shaped loadWebTreeSitter() rejection latches for the session (Node's ESM loader permanently memoizes the rejected module record for that URL, the same shape #1567/#1575 fixed for sgSessionHold) — but that verdict must not outlive the session that observed it, so a fresh session (or a process restart in between) gets a real re-attempt instead of a silently reused stale failure.",
+		probe: {
+			arm: () => {
+				const client = getSharedTreeSitterClient() as unknown as {
+					webTreeSitterLoadFailed: boolean;
+				} | null;
+				if (client) client.webTreeSitterLoadFailed = true;
+			},
+			isArmed: () => {
+				const client = getSharedTreeSitterClient() as unknown as {
+					webTreeSitterLoadFailed: boolean;
+				} | null;
+				return client ? client.webTreeSitterLoadFailed === false : true;
+			},
+			reset: () => resetTreeSitterClientLoadState(),
+		},
 	},
 
 	// ── The rest of the session_start reset chain ────────────────────────────
@@ -379,6 +461,24 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"The PATH walk memo must not outlive a session that installed something onto PATH.",
 	},
 	{
+		id: "installer:resolvedPathCache",
+		module: "installer/index.ts",
+		state: "resolvedPathCache",
+		policy: "session_start",
+		resetName: "resetResolvedPathCache",
+		reason:
+			"Bare cached commands return without a spawnability check, so a PATH change between sessions must clear this positive cache.",
+	},
+	{
+		id: "lsp-server:directCommandUnavailable",
+		module: "lsp/server.ts",
+		state: "directLspCommandUnavailableUntil, directLspCommandSkipLoggedUntil",
+		policy: "session_start",
+		resetName: "resetDirectLspCommandAvailability",
+		reason:
+			"A direct-LSP command that appears between sessions must receive a fresh availability probe instead of inheriting the prior negative cooldown.",
+	},
+	{
 		id: "lsp-server:classicTsRepairGuard",
 		module: "lsp/server.ts",
 		state: "the classic-tsserver repair guard",
@@ -386,6 +486,20 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetClassicTsRepairGuard",
 		reason:
 			"#1570: a repair that failed transiently in an earlier session must not stay latched for the rest of the extension-host process.",
+	},
+	{
+		id: "lsp-workspace-diagnostics-cache:sessionClock",
+		module: "lsp/workspace-diagnostics-session.ts",
+		state: "_sessionStartedAt",
+		policy: "session_start",
+		resetName: "resetWorkspaceDiagnosticsCacheSession",
+		reason:
+			"#1782: the clock that decides whether a cached finding predates this session is worthless if it keeps the first session's value for the life of the extension host.",
+		probe: {
+			arm: () => resetWorkspaceDiagnosticsCacheSession(0),
+			isArmed: () => workspaceDiagnosticsCacheSessionStart() > 0,
+			reset: () => resetWorkspaceDiagnosticsCacheSession(),
+		},
 	},
 	{
 		id: "lsp-index:globalLSPService",
@@ -396,12 +510,47 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		reason:
 			"The service is torn down and rebuilt per session; this reset is also the seam that carries the sweep hold and TS-repair guard resets.",
 	},
+	{
+		id: "formatters:whichLatches",
+		module: "formatters.ts",
+		state: "whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs (cleared together with detectionCache)",
+		policy: "session_start",
+		resetName: "clearFormatterCache",
+		reason:
+			"#1895: formatter PATH availability is session-scoped, but these module-local latches are not covered by the dispatch availability generation. A formatter installed or removed between sessions must be re-probed. The reset is `clearFormatterCache`, not the latch clear alone: `getFormattersForFile` answers a same-cwd lookup from `detectionCache` before it reaches a `which` probe, so dropping the latches without the selection cache re-arms every directory except the working one (review round on PR #1896).",
+	},
 
 	// ── Deliberately not session_start ───────────────────────────────────────
 	{
+		id: "biome-check:fixKindCache",
+		module: "dispatch/runners/biome-check.ts",
+		state: "biomeFixKindCache",
+		policy: "process_lifetime",
+		resetName: "_resetBiomeFixKindCacheForTests",
+		reason:
+			"#1810: the cache maps (biome binary path, rule name) to that rule's real fix tier, read live from `biome explain <rule>`. That answer is a static property of the running binary — it cannot change without a different biome install, which is itself a different cache key — so there is nothing for a session boundary to invalidate. No probe: arming it for real requires spawning the actual biome binary, which this generic registry sweep does not do; `tests/clients/dispatch/runners/biome-check-runner.test.ts`'s dedicated cache/reset tests cover the re-arm behavior with a mocked spawn instead.",
+	},
+	{
+		id: "startup-timing:hostReadyDelayAnchor",
+		module: "startup-timing.ts",
+		state: "hostReadyDelayAnchorConsumed",
+		policy: "process_lifetime",
+		resetName: "resetHostReadyDelayAnchorForTests",
+		reason:
+			"The load-complete timestamp has meaning only against the first session_start in this process; resetting it at a session boundary would fabricate host stalls from the original process boot.",
+		probe: {
+			arm: () => {
+				resetHostReadyDelayAnchorForTests();
+				consumeHostReadyDelayAnchor();
+			},
+			isArmed: () => consumeHostReadyDelayAnchor(),
+			reset: () => resetHostReadyDelayAnchorForTests(),
+		},
+	},
+	{
 		id: "formatters:runtimeState",
 		module: "formatters.ts",
-		state: "whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs",
+		state: "detectionCache",
 		policy: "turn_end",
 		resetName: "clearFormatterRuntimeState",
 		reason:
@@ -449,8 +598,9 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	// --- Host/toolchain derivations: the answer depends on the machine, not on
 	// the session. Re-deriving per session would just re-pay a spawn. ---
 	"lsp/jvm-runtime.ts": "resolved JVM location; a session boundary cannot move it",
+	"lsp/spawn-history.ts":
+		"successful spawn duration history intentionally spans session boundaries within the host process so later sessions can avoid waits that prior evidence proves cannot succeed",
 	"review-graph/git-identity.ts": "git user identity, read once per process",
-	"tree-sitter-shared.ts": "the shared parser client singleton",
 	"slow-fs.ts": "measured filesystem-latency classification of the host",
 	"tui-fit.ts": "terminal truncation-behavior probe",
 	"project-scale.ts": "project-scale base measurement, recomputed on its own inputs",
@@ -459,6 +609,10 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"generated-artifacts.ts": "generated-file classification derived from path patterns",
 	"git-tracked-ignore.ts":
 		"git tracked/ignored sets, invalidated by their own mtime checks rather than by the session boundary",
+	"blocker-freshness.ts":
+		"grammar-load memo plus a turn-scoped forward-import parse memo keyed on each file's own mtime and size; both re-derive from disk, so a session boundary cannot make them lie",
+	"diagnostic-line-freshness.ts":
+		"the #1641 past-EOF line-count memo, keyed on mtime AND size and re-stat'd on every read — a mismatch always recomputes, so it is invalidated by its own freshness check per file, not by the session boundary, same as git-tracked-ignore.ts",
 	"warm-attach.ts":
 		"the warm-attach IPC server and incumbent-PID role, which belong to the process instance, not the session; its served-diagnostic dedupe is keyed by content hash, so a carried entry can only mean the answer is unchanged",
 
@@ -486,7 +640,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"diagnostics-publish.ts": "diagnostics publisher registration and dirty-path dedupe",
 	"bus-events-logger.ts": "bus event rollup counters, an observability tally",
 	"ndjson-logger.ts": "registered log-file paths",
-	"latency-logger.ts": "the latency log file handle",
+	"latency-logger.ts":
+		"the scan's two flagged containers here are LAST_PHASE_EXCLUDED (a fixed, never-mutated Set of phase names — a constant, not state) and, since #1723, liveBrackets (the in-flight-phase bracket map). liveBrackets DOES have a genuine session-boundary reset, resetCurrentPhaseForSession — but it is called from the `pi.on(\"session_start\", ...)` handler in index.ts itself, BEFORE `handleSessionStart(...)` runs (deliberately: #1723 review F4 needs it positioned behind the #473 concurrent-secondary gate but is not part of handleSessionStart's own body), so `sessionStartResetNames()`'s walk — which starts specifically from handleSessionStart — cannot see it. Exempted here rather than added to SESSION_STATE_REGISTRY with a false reachability claim; see resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
 	"quiet-window.ts": "quiet-window task registration",
 	"quiet-window-config.ts":
 		"the env-derived quiet-window kill switch and wait budget, split out of quiet-window.ts by #1462; a memo of configuration, not of a session verdict",
@@ -517,4 +672,114 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"project-changes.ts": "change-log sequence fold counter, an observability tally",
 	"project-trust.ts":
 		"install-refusal warn-once set, tied to the trust decision rather than the session",
+	"lsp/workspace-diagnostics-cache.ts":
+		"#1669 review F1/F2/N3: a sweep-cwd discovery registry (idempotent — re-registers on every createWorkspaceDiagnosticsCacheContext call) plus a per-cwd cache epoch. Neither needs a session_start reset, but a session boundary is NOT harmless for the registry: a refresh for a cwd this process has not yet swept clears nothing on disk (the review's N3 finding) until that cwd is finally reached, at which point clearWorkspaceDiagnosticsCache's state.root fallback and the epoch's on-disk generation field (durable across the boundary, unlike the in-memory map alone) recover it. A session_start wipe would only widen that window, not close it, so exemption is still correct — the fix is durability at the write site, not a reset seam here.",
+};
+
+/**
+ * SYMBOL-granularity backstop for the file-granular audit above — #1817.
+ *
+ * `EXEMPT_SESSION_STATE_FILES` and `SESSION_STATE_REGISTRY` both answer "is
+ * this FILE accounted for". Neither answers "how many stateful symbols does
+ * the scan see IN it right now" — so a new module-level `Map`/`Set` added
+ * inside a file that already registered or exempted, is invisible to the
+ * coverage sweep. That is exactly #1801 review F1's shape: `staleGrammarVersionAt`
+ * landed on `TreeSitterClient` (backed by the already-registered
+ * `tree-sitter-shared.ts`) with no session_start reset, and the sweep stayed
+ * 55/55 green because the file itself was already accounted for.
+ *
+ * This table pins `scanSessionStateCandidates()`'s `containers.length` for
+ * every file the scan currently flags — registered AND exempted alike, since
+ * an exemption's reason is written against the symbols known at the time it
+ * was granted, and a new symbol arriving under cover of an old exemption is
+ * the same silent-drift shape. A count that no longer matches is not a
+ * failure by itself — it is a REQUIRED stop: decide whether the new symbol
+ * needs a registry entry, a reset, or its own exemption reason, then update
+ * the pinned number here.
+ *
+ * Generated from a full scan at the time this table was written (`node
+ * -e`-style dump of `scanSessionStateCandidates()`, one row per flagged
+ * file). Keep it sorted; the coverage test below diffs it against a live
+ * scan on every run, so a stale or missing entry reds immediately rather than
+ * silently under- or over-counting.
+ */
+export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
+	"agent-nudge.ts": 1,
+	"blocker-freshness.ts": 2,
+	"bounded-telemetry.ts": 2,
+	"bus-events-logger.ts": 1,
+	"bus-publish.ts": 0,
+	"cache-observability.ts": 1,
+	"degradation-ledger.ts": 3,
+	"diagnostic-dispositions.ts": 1,
+	"diagnostic-line-freshness.ts": 1,
+	"diagnostics-publish.ts": 1,
+	"dispatch/dispatcher.ts": 1,
+	// #1899 removed the dead `neighborTouchCache` (10 → 9).
+	"dispatch/integration.ts": 9,
+	"dispatch/lazy.ts": 0,
+	"dispatch/runners/ast-grep-napi.ts": 5,
+	"dispatch/runners/biome-check.ts": 1,
+	"dispatch/runners/psscriptanalyzer.ts": 2,
+	"dispatch/runners/spotbugs.ts": 0,
+	"dispatch/runners/utils/lazy-installer.ts": 2,
+	"dispatch/runners/utils/runner-helpers.ts": 7,
+	"disposition-publish.ts": 0,
+	"extension-log.ts": 2,
+	"format-events-publish.ts": 0,
+	"formatters.ts": 5,
+	"generated-artifacts.ts": 2,
+	"git-guard.ts": 1,
+	"git-tracked-ignore.ts": 3,
+	"installer/index.ts": 12,
+	"instance-registry.ts": 0,
+	"latency-logger.ts": 2,
+	"lens-config.ts": 1,
+	"lens-events.ts": 0,
+	"lsp-budget.ts": 0,
+	"lsp/cascade-tier.ts": 1,
+	"lsp/client.ts": 2,
+	"lsp/config.ts": 1,
+	"lsp/index.ts": 2,
+	"lsp/jvm-runtime.ts": 0,
+	"lsp/spawn-history.ts": 1,
+	"lsp/server.ts": 5,
+	"lsp/workspace-diagnostics-cache.ts": 1,
+	"lsp/workspace-sweep-hold.ts": 1,
+	"mcp/analyze.ts": 1,
+	"mcp/session.ts": 2,
+	"module-report-lsp.ts": 1,
+	"ndjson-logger.ts": 0,
+	"package-manager.ts": 2,
+	"project-changes.ts": 0,
+	"project-lens-config.ts": 3,
+	"project-report.ts": 1,
+	"project-scale.ts": 0,
+	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests, the bounded digest hook
+	// (see clients/project-snapshot.ts:605-609's own comment anticipating this).
+	"project-snapshot.ts": 6,
+	"project-trust.ts": 1,
+	"quiet-window-config.ts": 0,
+	"quiet-window.ts": 0,
+	"recent-touches.ts": 1,
+	"review-graph/builder.ts": 17,
+	"review-graph/git-identity.ts": 0,
+	"review-graph/shared-extraction-ir.ts": 1,
+	"review-graph/workspace-modules.ts": 2,
+	"runtime-config.ts": 0,
+	"runtime-tool-result.ts": 3,
+	"safe-spawn.ts": 3,
+	"session-lifecycle.ts": 0,
+	"sgconfig.ts": 2,
+	"slow-fs.ts": 0,
+	"smells-rollup.ts": 1,
+	"startup-timing.ts": 0,
+	"subagent-mode.ts": 0,
+	"tree-sitter-shared.ts": 0,
+	"tui-fit.ts": 0,
+	"warm-attach.ts": 0,
+	"widget-state.ts": 2,
+	"word-index.ts": 2,
+	"workspace-topology.ts": 2,
+	"zizmor-config.ts": 0,
 };

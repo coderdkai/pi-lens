@@ -1,6 +1,11 @@
 /** Bounded, process-local telemetry for behavior degraded during one session. */
 
 import { logExtension } from "./extension-log.js";
+import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import { logLatency } from "./latency-logger.js";
+
+// Re-exported so existing importers keep one name for the ledger's bound.
+export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
 	| "trust-refusal"
@@ -10,15 +15,42 @@ export type DegradationKind =
 	| "formatter-skip"
 	| "grammar-blocked"
 	| "lsp-breaker"
+	/**
+	 * A per-file touch skipped a language server because that server is in the
+	 * breaker cooldown or is latched permanently broken (#1743). During an
+	 * outage this fires once per file per touch, so the count here is the exact
+	 * total and only the FIRST skip per (server, file) also writes an
+	 * `lsp_client_skipped_broken` latency.log record.
+	 */
+	| "lsp-client-skipped-broken"
+	/**
+	 * A per-file touch skipped a language server because its direct spawn
+	 * command is temporarily marked unavailable (#1743). Same shape and same
+	 * bounding as `lsp-client-skipped-broken`, but keyed on the command, since
+	 * that is what the availability latch is about.
+	 */
+	| "lsp-client-skipped-unavailable-command"
 	| "formatter-failure"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"
+	| "lsp-scanner-coverage-gap"
+	| "lsp-notify-inflight-stall"
 	| "bus-stale"
 	| "query-predicates-invalid"
 	| "install-retry-exhausted"
 	| "ast-grep-napi-unavailable"
+	/**
+	 * `loadWebTreeSitter()` (clients/deps/web-tree-sitter.js) rejected during
+	 * MODULE EVALUATION, not resolution (#1592). Node's ESM loader permanently
+	 * memoizes a module record that threw while evaluating, so re-importing
+	 * the same resolved URL replays the cached rejection rather than
+	 * re-attempting the load — a same-process retry is dead. TreeSitterClient
+	 * latches this permanently instead of retrying on every parse call.
+	 */
+	| "web-tree-sitter-load-failed"
 	| "instance-registry-corrupt"
 	| "cascade-budget-override-disarmed"
+	| "lsp-pull-unconfirmed"
 	/**
 	 * A pi-lens `tool_call` handler threw. pi's `emitToolCall` has no
 	 * per-handler catch, so an escaped throw blocks the user's tool call —
@@ -31,7 +63,185 @@ export type DegradationKind =
 	 * The issue names this `path_variant_unresolved`; the ledger's kind
 	 * vocabulary is kebab-case, so it is spelled that way here.
 	 */
-	| "path-variant-unresolved";
+	| "path-variant-unresolved"
+	/**
+	 * A deferred-format record's origin (the cwd/worktree it was queued
+	 * under) does not match the flush attempting to claim it as an orphan,
+	 * so it stays queued and re-surfaces on every subsequent `agent_end`
+	 * until a flush from its actual origin claims it (#1642 F3, #1678
+	 * item 1).
+	 */
+	| "path-attribution-orphan-unresolved"
+	/**
+	 * A `textDocument/diagnostic` or `workspace/diagnostic` pull's per-request
+	 * `withTimeout` abandoned the request, and the request later settled anyway
+	 * (#1713). The answer arrived too late to serve the caller that timed out,
+	 * so it is discarded — this kind is the only trace that it ever landed.
+	 */
+	| "lsp-pull-late-answer"
+	/**
+	 * A managed npm tool's periodic version refresh did not complete, or the
+	 * refresh state file could not be read (#1730). The tool keeps serving on
+	 * the version already installed — this kind means pi-lens cannot prove that
+	 * version is the newest the tool's declared range permits.
+	 */
+	| "managed-tool-refresh"
+	/**
+	 * `navRequest`'s (`clients/lsp/client.ts`) per-request `withTimeout`
+	 * abandoned a hover/definition/references/etc. request (#1716). Every
+	 * timeout is counted here; only the FIRST occurrence per (method, file)
+	 * this session also writes a detailed `lsp_nav_request_timeout`
+	 * latency.log record — navRequest is the highest-volume LSP call site, so
+	 * a stuck server storming timeouts must not storm log writes too.
+	 */
+	| "lsp-nav-request-timeout"
+	/**
+	 * The abandoned request behind an `lsp-nav-request-timeout` settled anyway
+	 * after the caller gave up (#1716) — the nav-request sibling of
+	 * `lsp-pull-late-answer`. Nav answers are read-once (no persistent cache
+	 * to poison), but the count still tells a dogfood session whether a
+	 * "hung" server is truly hung or just answering late.
+	 */
+	| "lsp-nav-late-answer"
+	/**
+	 * The abandoned request behind an `lsp-pull-late-answer` timeout REJECTED
+	 * instead of answering (#1774) — e.g. a permanent server error such as
+	 * `RequestFailed` (-32803) surfacing after the caller gave up.
+	 * `ContentModified` (-32801) does NOT reach here: `safeSendRequest`
+	 * retries it once internally and resolves `undefined` rather than
+	 * rejecting. Without this kind, "timeout then silence" and "timeout then
+	 * rejection" both read as the same nothing in latency.log, which is
+	 * exactly the discrimination #1549's requests-die-or-arrive-late verdict
+	 * needs. The rejection handler still swallows the error; this only
+	 * observes it.
+	 */
+	| "lsp-pull-late-rejection"
+	/**
+	 * A `textDocument/diagnostic` or `workspace/diagnostic` pull's per-request
+	 * `withTimeout` abandoned a GENUINELY dispatched request (#1771). Every
+	 * pull timeout emits a detailed `lsp_pull_diagnostic_timeout` latency.log
+	 * record already, but until now that record counted nothing in the
+	 * ledger — the bounded-telemetry rule (`clients/bounded-telemetry.ts`)
+	 * says a failure path omits `ledgerKind` only when it is not a
+	 * degradation, and an abandoned pull is one. Subject carries server and
+	 * file so a storming server is visible in aggregate, not just per-event.
+	 */
+	| "lsp-pull-diagnostic-timeout"
+	/**
+	 * A `textDocument/diagnostic` or `workspace/diagnostic` pull was SKIPPED
+	 * outright because the caller's budget was already exhausted (#1773,
+	 * review round). Not dispatched, so it is not an LSP-side degradation the
+	 * way `lsp-pull-diagnostic-timeout` is — the server never saw the
+	 * request — but a caller that repeatedly hands out exhausted budgets to
+	 * this call site is itself a shape worth seeing in aggregate (e.g. a
+	 * sweep whose own upstream deadline math is too tight). Subject carries
+	 * server and file for the same reason every other pull kind does.
+	 */
+	| "lsp-pull-skipped-budget-exhausted"
+	/**
+	 * A `GenerationHandle.guardedWrite` (`clients/generation-guard.ts`) dropped
+	 * a post-await write because the generation it captured is no longer
+	 * current (#1754) — a session reset, a cache refresh, or a newer request
+	 * for the same key landed while the write's producer was in flight. The
+	 * drop is correct: the write belongs to a world that no longer exists.
+	 * It is recorded because a silently dropped write is indistinguishable
+	 * from a guard that never fires, which is how two hand-rolled versions of
+	 * this guard reached review vacuous. Subject carries the source name and
+	 * the identity of the dropped write.
+	 */
+	| "generation-guard-stale-write"
+	/**
+	 * A shell-out linter/analyzer runner (knip, vulture, jscpd, trivy-config, …)
+	 * produced no usable output — empty stdout, unparseable stdout (e.g. a
+	 * rejected CLI flag that prints usage text instead of the expected report;
+	 * #1757), or (for report-file runners) no report file — on a NONZERO exit
+	 * (#1736). The empty-result branches these runners fall back to for "no
+	 * findings" must never fire here: a broken shim, crash, rejected flag, or
+	 * config-load error must read as errored/skipped, not clean. Reason names
+	 * the binary and exit status so a stuck/corrupted runner is diagnosable
+	 * from the ledger alone.
+	 */
+	| "runner-empty-result"
+	/** A process-table resource sample failed or timed out; it is unknown. */
+	| "resource-sampler-query-failed"
+	/**
+	 * The registry-independent orphan backstop could not enumerate the OS
+	 * process table (spawn error or scan timeout). Its empty result therefore
+	 * means "did not look", not "found nothing" (#1857 item 2) — the same
+	 * clean-vs-errored discrimination `runner-empty-result` makes for
+	 * shell-out runners.
+	 */
+	| "orphan-backstop-scan-failed"
+	/**
+	 * A backstop kill was attempted and the process was still alive
+	 * afterwards. Subject carries `<binary>#<pid>` so a permanently unkillable
+	 * process is identifiable, instead of counting as a successful reap and
+	 * paying the full sweep again every session (#1857 items 1 and 3).
+	 */
+	| "orphan-backstop-kill-unverified"
+	/**
+	 * A backstop candidate passed every other eligibility test, but the OS
+	 * snapshot reported no usable process creation time. The spawn-grace guard
+	 * could not rule out "spawned seconds ago, not yet registered", so the
+	 * process was spared (#1857 item 4). Without this record the guard would
+	 * be indistinguishable from finding nothing.
+	 */
+	| "orphan-backstop-age-unknown"
+	/**
+	 * Same as `orphan-backstop-kill-unverified`, for the registry-driven
+	 * reaper path, which spelled the identical attempt-counted-as-kill defect
+	 * (#1857 class sweep).
+	 */
+	| "orphan-reap-kill-unverified"
+	/**
+	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
+	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
+	 * so a scanner that survived its own sweep's escalation — an orphan sweep
+	 * leaking an orphan — is visible rather than silent.
+	 */
+	| "orphan-backstop-scanner-escalated"
+	/**
+	 * `session_start`'s bounded change-log sequence read (#1162) blew its
+	 * budget and a project snapshot existed on disk, but the freshness gate
+	 * could not tell whether that snapshot was current (#1785). Hydration was
+	 * skipped for the synchronous startup path; the deferred read (still
+	 * running in the background) retroactively hydrates the runtime once it
+	 * lands, unless the session had already advanced by then. Subject carries
+	 * the project root so a project that repeatedly starves this read is
+	 * visible in aggregate, not just per-session.
+	 */
+	| "snapshot-sequence-read-timeout"
+	/**
+	 * `biome-check.ts`'s `resolveBiomeFixKinds` (#1810) couldn't get a real
+	 * fix-tier verdict for a rule from `biome explain <rule>` — either the
+	 * spawn itself failed/exited nonzero, or it succeeded but the output
+	 * matched neither the `- Fix: safe|unsafe` nor `- No fix available.`
+	 * shape (e.g. a biome 1.x install, whose `explain` text differs). Both
+	 * cases resolve the rule to "not fixable" for that one call WITHOUT
+	 * caching the verdict — a poisoned cache entry would make a genuinely
+	 * fixable rule permanently unfixable for the rest of the process. Subject
+	 * carries the rule name so a specific stuck rule (vs. a whole-binary
+	 * mismatch) is diagnosable from the ledger alone.
+	 */
+	| "biome-explain-unavailable"
+	/**
+	 * The tier-3 cascade's outstanding-touch registry
+	 * (`clients/lsp/cascade-tier.ts`) reached its cap before a quiet-window
+	 * reconcile drained it, so the oldest touch was dropped unanswered (#1899).
+	 * The registry is drained in full by every sweep, but the sweep runs on
+	 * pi's `agent_settled` window and dogfood logs show gaps up to 52 minutes;
+	 * this kind means a session out-touched that cadence.
+	 */
+	| "cascade-tier3-backlog-evicted"
+	/**
+	 * `read-guard.ts`'s per-file record cap (`READ_GUARD_MAX_RECORDS_PER_FILE`)
+	 * trimmed a file's read history (#1913). A hot file trimmed on every push
+	 * once it's past the cap, so this kind's rising edge gates the matching
+	 * `read_cap_trimmed` read-guard.log line to the first trim and
+	 * power-of-two milestones after it — the ledger's own dedupe, not a
+	 * hand-rolled per-file Set (#1913 review F1).
+	 */
+	| "read-guard-record-cap-trim";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -71,7 +281,7 @@ export function getDegradationLedgerGeneration(): number {
 	return ledgerGeneration;
 }
 
-export function recordDegradation(record: DegradationRecord): void {
+export function recordDegradation(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
 		const subject = truncateForLedger(record.subject);
@@ -81,15 +291,18 @@ export function recordDegradation(record: DegradationRecord): void {
 			group = { count: 0, entries: [] };
 			groups.set(kind, group);
 		}
+		const admitted = group.entries.length < ENTRIES_PER_KIND;
 		group.count += 1;
 		// Bounded at RECORD time (#1366 review): reasons carry arbitrary error
 		// text; a 10KB message must never become a 10KB health line or a 10KB
 		// retained string.
 		group.entries.push({ subject, reason });
 		if (group.entries.length > ENTRIES_PER_KIND) group.entries.shift();
+		return admitted;
 	} catch (error) {
 		debugLedgerFailure("record", error);
 		// Telemetry must never break the observed path.
+		return false;
 	}
 }
 
@@ -101,7 +314,9 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		const key = `${kind}\0${subject}`;
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
-		recordDegradation({ kind, subject, reason: record.reason });
+		if (recordDegradation({ kind, subject, reason: record.reason })) {
+			logDurableDegradation(kind, subject, 1);
+		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
 		// Telemetry must never break the observed path.
@@ -111,8 +326,16 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 /**
  * Count a repeated degradation while retaining one latest-reason entry per
  * kind/subject. The group count remains the exact event total.
+ *
+ * Returns `true` when this call is the FIRST occurrence recorded for this
+ * kind/subject pair (the ledger is the single source of truth for that
+ * tally already — via `tallies` — so callers that need a once-per-subject
+ * "rising edge" signal, e.g. to gate a verbose one-time log line before
+ * falling back to the bounded count, read it off this return value instead
+ * of hand-rolling their own parallel `Set`/latch). #1716 reuses this same
+ * signal to gate `navRequest`'s detailed timeout/late-answer log writes.
  */
-export function incrementDegradationCount(record: DegradationRecord): void {
+export function incrementDegradationCount(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
 		const subject = truncateForLedger(record.subject);
@@ -125,23 +348,50 @@ export function incrementDegradationCount(record: DegradationRecord): void {
 			group = { count: 0, entries: [] };
 			groups.set(kind, group);
 		}
+		const existing = group.entries.findIndex(
+			(candidate) => candidate.subject === subject,
+		);
+		const admitted = existing >= 0 || group.entries.length < ENTRIES_PER_KIND;
 		group.count += 1;
-		const entry = { subject, reason: truncateForLedger(`${reason} (count: ${count})`) };
-		const existing = group.entries.findIndex((candidate) => candidate.subject === subject);
+		// #1816: append the count AFTER truncation, never before. `reason` is
+		// already bounded above, so re-truncating the concatenation pushed the
+		// suffix past LEDGER_FIELD_MAX and silently ate it — a 200-char reason
+		// lost the one field that says how often the degradation fired.
+		const entry = { subject, reason: `${reason} (count: ${count})` };
 		if (existing >= 0) group.entries.splice(existing, 1);
 		group.entries.push(entry);
 		if (group.entries.length > ENTRIES_PER_KIND) group.entries.shift();
+		// Durable rows use the summary's admission and emit the first event and
+		// power-of-two milestones only, keeping the sink bounded.
+		if (admitted && isPowerOfTwo(count)) {
+			logDurableDegradation(kind, subject, count);
+		}
+		return count === 1;
 	} catch (error) {
 		debugLedgerFailure("increment", error);
 		// Telemetry must never break the observed path.
+		return false;
 	}
 }
 
-/** Detached snapshot, grouped in first-seen kind order. */
-const LEDGER_FIELD_MAX = 200;
+/**
+ * Persist the accepted ledger mutation through the existing rotated NDJSON
+ * latency stream. `logLatency` owns the timestamp, PID, serialization, secret
+ * redaction, and write queue. The subject and kind were already bounded by the
+ * ledger before reaching this seam.
+ */
+function logDurableDegradation(kind: string, subject: string, count: number): void {
+	logLatency({
+		type: "phase",
+		phase: "degradation_ledger",
+		filePath: subject,
+		durationMs: 0,
+		metadata: { kind, subject, count, ledgerGeneration },
+	});
+}
 
-function normalizeForLedger(value: unknown): string {
-	return String(value ?? "unknown");
+function isPowerOfTwo(value: number): boolean {
+	return value > 0 && (value & (value - 1)) === 0;
 }
 
 function boundedKind(value: unknown): string {
@@ -149,13 +399,6 @@ function boundedKind(value: unknown): string {
 	if (groups.has(kind) || kind === OVERFLOW_KIND) return kind;
 	// Keep one slot available for all kinds beyond the cardinality bound.
 	return groups.size < MAX_DISTINCT_KINDS - 1 ? kind : OVERFLOW_KIND;
-}
-
-function truncateForLedger(value: unknown): string {
-	const text = normalizeForLedger(value);
-	return text.length > LEDGER_FIELD_MAX
-		? `${text.slice(0, LEDGER_FIELD_MAX)}…`
-		: text;
 }
 
 export function getDegradationSummary(): DegradationGroup[] {
@@ -187,7 +430,9 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
 	});
 }
 
-export function renderDegradationLines(summary: unknown = getDegradationSummary()): string[] {
+export function renderDegradationLines(
+	summary: unknown = getDegradationSummary(),
+): string[] {
 	if (!isRenderableSummary(summary)) return [];
 	if (summary.length === 0) return [];
 	return [

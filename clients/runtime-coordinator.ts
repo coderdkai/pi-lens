@@ -95,6 +95,72 @@ export interface DeferredMutationRecord {
 export type DeferredFormatRecord = DeferredMutationRecord;
 
 /**
+ * A cached blocking finding re-served at turn end until it is resolved (#1561).
+ *
+ * #1631 adds a freshness baseline (`recordedAtMs`) and a `stale` flag. A blocker is
+ * a verdict about the file AND everything it imports; when a dependency drifts on
+ * disk after the verdict, the turn-boundary freshness sweep
+ * (`clients/blocker-freshness.ts`) sets `stale` so the entry is demoted to a
+ * `[stale — re-run to confirm]` advisory instead of being re-asserted at full
+ * authority (#1419 demote-not-drop precedent).
+ */
+export interface InlineBlockerRecord {
+	filePath: string;
+	summary: string;
+	/**
+	 * #1561: the `nextWriteIndex()` token of the dispatch that produced this
+	 * verdict. Without it the record carries no evidence of WHICH state it
+	 * was a verdict about, so a later confirmed-clean result cannot be
+	 * ordered against it and #1198's invariants 1-2 (a slow old clean must
+	 * not erase a newer blocker) are unenforceable.
+	 */
+	writeIndex?: number;
+	/**
+	 * #1561 F1: the `tool` ids of the blocking diagnostics behind this
+	 * summary. Inline blockers are NOT an LSP-only concept — `dispatcher.ts`
+	 * builds them from `semantic === "blocking"` across EVERY runner, so an
+	 * eslint, biome-check, actionlint, or ast-grep security-rule finding
+	 * (`cors-wildcard`, `no-commented-credentials`) lands here too. A retire
+	 * driven by a language-server verdict must therefore prove it covers the
+	 * sources that actually raised the blocker; without this field the record
+	 * carries no way to tell an `lsp`-origin blocker from a security-rule one,
+	 * and an LSP-only clean silently retires both.
+	 */
+	sources?: readonly string[];
+	/**
+	 * #1631: wall-clock ms when the verdict was recorded. Baseline for the
+	 * turn-boundary freshness sweep, which compares the file's and its forward
+	 * imports' on-disk mtime against it. Unstamped (legacy) records are left
+	 * untouched by the sweep.
+	 */
+	recordedAtMs?: number;
+	/**
+	 * #1631: set by the freshness sweep when the file or a forward import
+	 * drifted after the verdict. A stale entry is demoted out of the
+	 * authoritative blocker channel at turn end.
+	 */
+	stale?: boolean;
+	/**
+	 * #1641: which gate demoted this entry, so a sibling gate re-deriving its
+	 * OWN verdict never heals a demotion it didn't make — the same discipline
+	 * `WidgetDiagnostic.staleReason` already uses on the widget/lens surfaces.
+	 * `"dependency-drift"` (#1631/`blocker-freshness.ts`) is a one-way latch
+	 * for this session (cleared only by a fresh dispatch or confirmed-clean
+	 * retire); `"past-eof"` (#1641/`blocker-past-eof.ts`) RE-ARMS every turn
+	 * end, since a transient shrink-then-restore of the file must un-demote it.
+	 */
+	staleReason?: "dependency-drift" | "past-eof";
+	/**
+	 * #1641: the 1-based cited lines of the diagnostics behind `summary`,
+	 * captured at write time (`dispatchResult.blockers[].line` in
+	 * `pipeline.ts`) rather than re-parsed from the rendered text — see
+	 * `PipelineResult.inlineBlockerLines`'s doc comment for why. Empty/absent
+	 * when no blocker in this record cited a line.
+	 */
+	lines?: readonly number[];
+}
+
+/**
  * The canonical target `tool_call` resolved for one specific call, recorded
  * by tool-call identity (#1642). `tool_result`'s paired handler MUST look
  * this up and use `resolvedPath` as-is instead of re-deriving a path from its
@@ -222,30 +288,8 @@ export class RuntimeCoordinator {
 		string,
 		{ status: "warming" | "ready"; ts: number }
 	>();
-	private readonly _pendingInlineBlockers = new PathKeyedMap<{
-		filePath: string;
-		summary: string;
-		/**
-		 * #1561: the `nextWriteIndex()` token of the dispatch that produced this
-		 * verdict. Without it the record carries no evidence of WHICH state it
-		 * was a verdict about, so a later confirmed-clean result cannot be
-		 * ordered against it and #1198's invariants 1-2 (a slow old clean must
-		 * not erase a newer blocker) are unenforceable.
-		 */
-		writeIndex?: number;
-		/**
-		 * #1561 F1: the `tool` ids of the blocking diagnostics behind this
-		 * summary. Inline blockers are NOT an LSP-only concept — `dispatcher.ts`
-		 * builds them from `semantic === "blocking"` across EVERY runner, so an
-		 * eslint, biome-check, actionlint, or ast-grep security-rule finding
-		 * (`cors-wildcard`, `no-commented-credentials`) lands here too. A retire
-		 * driven by a language-server verdict must therefore prove it covers the
-		 * sources that actually raised the blocker; without this field the record
-		 * carries no way to tell an `lsp`-origin blocker from a security-rule one,
-		 * and an LSP-only clean silently retires both.
-		 */
-		sources?: readonly string[];
-	}>(normalizeMapKey);
+	private readonly _pendingInlineBlockers =
+		new PathKeyedMap<InlineBlockerRecord>(normalizeMapKey);
 	private readonly _actionableWarningsThisTurn = new Map<
 		string,
 		ActionableWarningRecord
@@ -784,17 +828,72 @@ export class RuntimeCoordinator {
 		summary: string,
 		writeIndex?: number,
 		sources?: readonly string[],
+		lines?: readonly number[],
 	): void {
 		this._pendingInlineBlockers.set(path.resolve(filePath), {
 			filePath,
 			summary,
 			writeIndex,
 			sources,
+			lines,
+			recordedAtMs: Date.now(),
+			stale: false,
 		});
 	}
 
 	clearInlineBlockers(filePath: string): void {
 		this._pendingInlineBlockers.delete(path.resolve(filePath));
+	}
+
+	/**
+	 * #1631: demote a cached blocker to stale without dropping it (#1419
+	 * demote-not-drop). Called by the turn-boundary freshness sweep when the
+	 * file or one of its forward imports drifted on disk after the verdict.
+	 * Idempotent: re-marking an already-stale entry (for ANY reason) is a
+	 * no-op — a `"past-eof"` demotion already took this record out of the
+	 * authoritative channel, and `sweepInlineBlockerFreshness` re-checks next
+	 * turn once that heals. Returns true only when this call transitioned the
+	 * entry to stale, so a caller can log the demotion exactly once.
+	 */
+	markInlineBlockerStale(
+		filePath: string,
+		reason: "dependency-drift" | "past-eof" = "dependency-drift",
+	): boolean {
+		const key = path.resolve(filePath);
+		const existing = this._pendingInlineBlockers.get(key);
+		if (!existing || existing.stale) return false;
+		this._pendingInlineBlockers.set(key, {
+			...existing,
+			stale: true,
+			staleReason: reason,
+		});
+		return true;
+	}
+
+	/**
+	 * #1641: re-derive the past-EOF demotion for one inline-blocker record.
+	 * Unlike {@link markInlineBlockerStale} (a one-way latch for the
+	 * dependency-drift gate), this RE-ARMS: called every turn end with the
+	 * gate's freshly-computed verdict, it can both demote (rising edge) and
+	 * heal (falling edge — a transient shrink-then-restore of the file). Never
+	 * touches a record a sibling gate demoted (`staleReason !== "past-eof"`
+	 * while `stale`) — composing with #1631's dependency-drift gate means each
+	 * gate only heals its own demotions. Returns true only on an actual
+	 * transition, so the caller logs/resyncs exactly once per edge.
+	 */
+	setInlineBlockerPastEofStale(filePath: string, isPastEof: boolean): boolean {
+		const key = path.resolve(filePath);
+		const existing = this._pendingInlineBlockers.get(key);
+		if (!existing) return false;
+		if (existing.stale && existing.staleReason !== "past-eof") return false;
+		const currentlyPastEof = !!existing.stale && existing.staleReason === "past-eof";
+		if (currentlyPastEof === isPastEof) return false;
+		this._pendingInlineBlockers.set(key, {
+			...existing,
+			stale: isPastEof,
+			staleReason: isPastEof ? "past-eof" : undefined,
+		});
+		return true;
 	}
 
 	/**
@@ -871,7 +970,7 @@ export class RuntimeCoordinator {
 		// Existence-checking the display path and rebuilding survivors avoids
 		// the key-mismatch entirely; live survivors re-set to identical keys
 		// (both realpath), so only the stale entries are dropped.
-		const survivors: Array<[string, { filePath: string; summary: string }]> =
+		const survivors: Array<[string, InlineBlockerRecord]> =
 			[];
 		for (const [displayPath, value] of this._pendingInlineBlockers.entries()) {
 			if (fs.existsSync(displayPath)) survivors.push([displayPath, value]);
@@ -896,12 +995,12 @@ export class RuntimeCoordinator {
 	 * bounded (once per turn_end / tool_result), so the probe cost is
 	 * negligible.
 	 */
-	getInlineBlockersSnapshot(): Array<{ filePath: string; summary: string }> {
+	getInlineBlockersSnapshot(): InlineBlockerRecord[] {
 		this.reconcileInlineBlockers();
 		return [...this._pendingInlineBlockers.values()];
 	}
 
-	consumeInlineBlockers(): Array<{ filePath: string; summary: string }> {
+	consumeInlineBlockers(): InlineBlockerRecord[] {
 		const entries = this.getInlineBlockersSnapshot();
 		this._pendingInlineBlockers.clear();
 		return entries;

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
@@ -11,6 +12,7 @@ import {
 } from "../../clients/diagnostic-dispositions.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 
 const projectDiagnosticsMocks = vi.hoisted(() => ({
 	scanProjectDiagnostics: vi.fn(),
@@ -77,15 +79,37 @@ const mockSummaries: ReturnType<
 > = [];
 
 let mockStaleDropped = 0;
+let mockDependencyDemoted = 0;
 
 const reconcileScanDiagnosticsMock = vi.fn();
+const reconcileCorrelatedScanDiagnosticsMock = vi.fn();
 
-vi.mock("../../clients/widget-state.js", () => ({
-	getFileDiagnosticSummaries: () => mockSummaries,
-	reconcileStaleWidgetFiles: async () => mockStaleDropped,
-	reconcileScanDiagnostics: (...args: unknown[]) =>
-		reconcileScanDiagnosticsMock(...args),
-}));
+vi.mock("../../clients/widget-state.js", async (importOriginal) => {
+	const actual = await importOriginal<
+		typeof import("../../clients/widget-state.js")
+	>();
+	return {
+		...actual,
+		getFileDiagnosticSummaries: () => mockSummaries,
+		reconcileStaleWidgetFiles: async () => mockStaleDropped,
+		reconcileStaleWidgetDependencyBlockers: async () => mockDependencyDemoted,
+		reconcileScanDiagnostics: (...args: unknown[]) =>
+			reconcileScanDiagnosticsMock(...args),
+		reconcileCorrelatedScanDiagnostics: (...args: unknown[]) =>
+			reconcileCorrelatedScanDiagnosticsMock(...args),
+	};
+});
+
+// #1641: the past-EOF gate's demote/log logic is real (imported for real
+// below); only its resync side effect is mocked here so a demoted-line test
+// never reaches into the real LSP service / spawns a real language server.
+const resyncDocumentOnPastEofMock = vi.hoisted(() => vi.fn());
+vi.mock("../../clients/diagnostic-line-freshness.js", async (importOriginal) => {
+	const actual = await importOriginal<
+		typeof import("../../clients/diagnostic-line-freshness.js")
+	>();
+	return { ...actual, resyncDocumentOnPastEof: resyncDocumentOnPastEofMock };
+});
 
 beforeEach(() => {
 	projectDiagnosticsMocks.scanProjectDiagnostics.mockReset();
@@ -100,7 +124,9 @@ beforeEach(() => {
 	});
 	mockSummaries.length = 0;
 	mockStaleDropped = 0;
+	mockDependencyDemoted = 0;
 	reconcileScanDiagnosticsMock.mockReset();
+	reconcileCorrelatedScanDiagnosticsMock.mockReset();
 	resetProjectLensConfigCache();
 });
 
@@ -149,6 +175,62 @@ function withIgnoredFixture<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
 		resetProjectLensConfigCache();
 	});
 }
+
+// ── compact render header ────────────────────────────────────────────────────
+
+// #1799: the compact header (shown in the tool-call row) reads details.totalBlocking
+// / details.totalErrors / details.totalWarnings directly — no execute() call
+// involved. `totalBlocking` and `totalErrors` count the SAME findings unless a
+// #1631 dependency-drift demotion has revoked an error's blocking authority
+// (widget-state.ts `isBlocking` vs `countDiagnostics`) while leaving it in the
+// error tally — that's the one case the two totals genuinely disagree. The
+// header must not print both terms for the same findings when blocking > 0,
+// but must still surface drift-demoted errors when blocking === 0.
+describe("lens_diagnostics compact render header", () => {
+	const identityTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+
+	function renderHeader(details: Record<string, unknown>) {
+		const tool = makeTool();
+		const component = tool.renderResult?.(
+			{ content: [{ type: "text", text: "" }], details, isError: false },
+			{ expanded: false },
+			identityTheme,
+			{ args: { mode: "all" }, lastComponent: undefined },
+		);
+		return (component?.render(200) ?? []).join("\n");
+	}
+
+	it("shows blocking and warnings only — no redundant errors term when blocking > 0 (#1799)", () => {
+		const line = renderHeader({
+			mode: "all",
+			totalBlocking: 3,
+			totalErrors: 3,
+			totalWarnings: 2,
+			filesWithIssues: 1,
+		});
+		expect(line).toContain("3 blocking");
+		expect(line).toContain("2 warnings");
+		expect(line).not.toMatch(/\b3 errors?\b/);
+	});
+
+	// F1 regression: 3 dependency-drift-demoted errors (#1631) have
+	// blocking: 0, errors: 3 by design — isBlocking excludes any stale entry,
+	// but countDiagnostics keeps a drift demotion (unlike past-eof) in the
+	// error tally. An over-corrected fix that drops the errors term entirely
+	// would render this "clean", contradicting the per-file row (3E) and the
+	// TUI footer (●3E). The errors term must still surface when blocking === 0.
+	it("surfaces drift-demoted errors when blocking is 0, instead of reporting clean (#1799 F1)", () => {
+		const line = renderHeader({
+			mode: "all",
+			totalBlocking: 0,
+			totalErrors: 3,
+			totalWarnings: 0,
+			filesWithIssues: 1,
+		});
+		expect(line).not.toContain("clean");
+		expect(line).toContain("3 errors");
+	});
+});
 
 // ── schema ────────────────────────────────────────────────────────────────────
 
@@ -323,38 +405,134 @@ describe("lens_diagnostics mode=delta", () => {
 	});
 
 	it("formats project diagnostics delta records", async () => {
-		projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
-			undefined,
-		);
-		projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue({
-			version: 1,
-			cwd: "/proj",
-			generatedAt: "2026-01-01T00:00:00.000Z",
-			sessionId: "session-1",
-			turnIndex: 3,
-			diagnostics: [
-				{
-					filePath: "/proj/src/knip.ts",
-					line: 12,
-					severity: "error",
-					semantic: "blocking",
-					tool: "knip",
-					runner: "knip",
-					rule: "knip:unlisted",
-					message: "Unlisted dependency lodash",
-					source: "project-scan",
-				},
-			],
-			sources: ["knip"],
-		});
+		// #1634 review round R3: appendProjectDiagnosticsDeltaLines now
+		// freshness-gates against the report's own `generatedAt` (a missing
+		// cited file is dropped), so this needs a REAL file — a fixed fake
+		// path like the pre-fix fixture used would just be dropped as missing.
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-delta-"));
+		try {
+			const filePath = path.join(cwd, "src", "knip.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			// Report generated AFTER the file write, so the gate reads it live.
+			const generatedAt = new Date(Date.now() + 60_000).toISOString();
 
-		const result = await run(makeTool(), { mode: "delta" });
-		const text = String(result.content[0].text);
-		expect(text).toContain("knip.ts");
-		expect(text).toContain("L12");
-		expect(text).toContain("knip:unlisted");
-		expect(text).toContain("Unlisted dependency lodash");
-		expect(result.details).toMatchObject({ projectDiagnostics: 1 });
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+				undefined,
+			);
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue({
+				version: 1,
+				cwd,
+				generatedAt,
+				sessionId: "session-1",
+				turnIndex: 3,
+				diagnostics: [
+					{
+						filePath,
+						line: 12,
+						severity: "error",
+						semantic: "blocking",
+						tool: "knip",
+						runner: "knip",
+						rule: "knip:unlisted",
+						message: "Unlisted dependency lodash",
+						source: "project-scan",
+					},
+				],
+				sources: ["knip"],
+			});
+
+			const result = await run(makeTool(), { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).toContain("knip.ts");
+			expect(text).toContain("L12");
+			expect(text).toContain("knip:unlisted");
+			expect(text).toContain("Unlisted dependency lodash");
+			expect(result.details).toMatchObject({ projectDiagnostics: 1 });
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("#1634 review round R3: demotes a project-diagnostics-delta finding whose file was edited after the report was generated", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-delta-stale-"));
+		try {
+			const filePath = path.join(cwd, "src", "drift.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			// Report generated BEFORE the file's mtime — the cited line 12 is
+			// stale by the time delta mode re-serves it.
+			const generatedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+				undefined,
+			);
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue({
+				version: 1,
+				cwd,
+				generatedAt,
+				sessionId: "session-1",
+				turnIndex: 3,
+				diagnostics: [
+					{
+						filePath,
+						line: 12,
+						severity: "error",
+						semantic: "blocking",
+						tool: "knip",
+						runner: "knip",
+						rule: "knip:unlisted",
+						message: "Unlisted dependency lodash",
+						source: "project-scan",
+					},
+				],
+				sources: ["knip"],
+			});
+
+			const result = await run(makeTool(), { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).toContain("Unlisted dependency lodash");
+			expect(text).not.toContain("L12");
+			expect(text).toContain("stale — re-run to confirm");
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	});
+
+	it("#1634 review round R3: drops a project-diagnostics-delta finding whose cited file no longer exists", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-delta-gone-"));
+		try {
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+				undefined,
+			);
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue({
+				version: 1,
+				cwd,
+				generatedAt: new Date().toISOString(),
+				sessionId: "session-1",
+				turnIndex: 3,
+				diagnostics: [
+					{
+						filePath: path.join(cwd, "src", "gone.ts"),
+						line: 12,
+						severity: "error",
+						semantic: "blocking",
+						tool: "knip",
+						runner: "knip",
+						rule: "knip:unlisted",
+						message: "vanished project finding",
+						source: "project-scan",
+					},
+				],
+				sources: ["knip"],
+			});
+
+			const result = await run(makeTool(), { mode: "delta" }, cwd);
+			const text = String(result.content[0].text);
+			expect(text).not.toContain("vanished project finding");
+		} finally {
+			removeTempDirSync(cwd);
+		}
 	});
 
 	it("filters ignored actionable, quality, and project-delta entries (#279)", async () =>
@@ -522,6 +700,46 @@ describe("lens_diagnostics mode=full", () => {
 			totalBlocking: 1,
 			totalWarnings: 1,
 		});
+	});
+
+	it("#1549 delivers an answering server's finding while naming only the silent auxiliary lane", async () => {
+		mockSummaries.length = 0;
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/partial.ts",
+					diagnostics: [
+						{
+							severity: 1,
+							message: "fast TypeScript answer",
+							range: {
+								start: { line: 0, character: 0 },
+								end: { line: 0, character: 4 },
+							},
+							source: "typescript",
+						},
+					],
+					count: 1,
+					unconfirmedServerIds: ["typos"],
+				},
+			]),
+		};
+
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("fast TypeScript answer");
+		expect(text).toContain("Auxiliary coverage incomplete: typos");
+		expect(text).not.toContain("LSP sweep: 0 file(s) confirmed");
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 1,
+			lspFilesUnconfirmed: 0,
+			lspFilesPartiallyCovered: 1,
+			unconfirmedLspServerIds: ["typos"],
+		});
+		// Partial coverage may be delivered, but it cannot replace a footer
+		// snapshot that may still contain the silent scanner's prior finding.
+		expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
 	});
 
 	it("uses an event-captured repaint when a server becomes ready mid-sweep (#798/#338)", async () => {
@@ -1131,6 +1349,65 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	it("projects napi findings into widget state while the matching LSP file is unconfirmed (#1888)", async () => {
+		const filePath = "/proj/src/backpressure-broken.ts";
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath,
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+					unconfirmedReason: "service_destroyed",
+				},
+			]),
+		};
+		projectDiagnosticsMocks.scanProjectDiagnostics.mockResolvedValue({
+			version: 2,
+			cwd: "/proj",
+			tier: "cheap",
+			scannedAt: "2026-08-20T14:30:14.000Z",
+			filesScanned: 1,
+			runners: ["ast-grep-napi"],
+			diagnostics: Array.from({ length: 3 }, (_, index) => ({
+				filePath,
+				line: index + 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "ast-grep-napi",
+				runner: "ast-grep-napi",
+				rule: `self-scan-${index + 1}`,
+				message: `napi finding ${index + 1}`,
+				source: "project-scan",
+			})),
+		});
+
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			refreshRunners: "cheap",
+		});
+
+		expect(result.details).toMatchObject({
+			lspFilesUnconfirmed: 1,
+			unconfirmedLspFiles: [filePath],
+		});
+		expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
+		expect(reconcileCorrelatedScanDiagnosticsMock).toHaveBeenCalledWith(
+			path.resolve(filePath),
+			expect.arrayContaining([
+				expect.objectContaining({
+					tool: "ast-grep-napi",
+					rule: "self-scan-1",
+					uri: `${pathToFileURL(filePath).href}#L1`,
+				}),
+				expect.objectContaining({ tool: "ast-grep-napi", rule: "self-scan-2" }),
+				expect.objectContaining({ tool: "ast-grep-napi", rule: "self-scan-3" }),
+			]),
+			undefined,
+			Date.parse("2026-08-20T14:30:14.000Z"),
+		);
+	});
+
 	it("refreshRunners=cached includes the stored project runner snapshot without scanning", async () => {
 		mockSummaries.length = 0;
 		const lspService = {
@@ -1256,12 +1533,16 @@ describe("lens_diagnostics mode=full", () => {
 		).toEqual({ "test-runner": 18 * 60_000 });
 	});
 
-	// #1623 fix-round F4: `CacheManager.readCache` accepts a missing/corrupt
+	// #1623 fix-round F4/F5: `CacheManager.readCache` accepts a missing/corrupt
 	// `meta.timestamp` as a cache HIT (the timestamp only gates staleness),
 	// so a corrupt test-runner-findings cache reaches `formatCacheAge` as
-	// NaN. Pre-fix-round this rendered "test-runner (NaNh old)" — a fabricated
-	// age is a worse honesty gap than the one #1623 exists to close.
-	it("renders 'age unknown' instead of NaN for a cache-read lane with a corrupt age (#1623 fix-round F4)", async () => {
+	// NaN. Pre-F4 this rendered "test-runner (NaNh old)" — a fabricated age is
+	// a worse honesty gap than the one #1623 exists to close. F4 fixed the NaN
+	// but the render call site still appended the literal word " old"
+	// unconditionally, so the result read "test-runner (age unknown old)" —
+	// ungrammatical, and still implying a real age exists. F5 makes "old" only
+	// appear once an age is actually known.
+	it("renders 'age unknown' with no trailing 'old' for a cache-read lane with a corrupt age (#1623 fix-round F5)", async () => {
 		mockSummaries.length = 0;
 		const lspService = {
 			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([]),
@@ -1282,7 +1563,7 @@ describe("lens_diagnostics mode=full", () => {
 		const text = String(result.content[0].text);
 		expect(text).not.toMatch(/NaN/i);
 		expect(text).toContain(
-			"served from cache this call (not re-run): test-runner (age unknown old).",
+			"served from cache this call (not re-run): test-runner (age unknown).",
 		);
 	});
 
@@ -2003,6 +2284,129 @@ describe("lens_diagnostics mode=all", () => {
 		expect(String(result.content[0].text)).toContain("✓");
 	});
 
+	describe("past-EOF diagnostic gate (#1641)", () => {
+		afterEach(() => {
+			resyncDocumentOnPastEofMock.mockReset();
+		});
+
+		it("RED CASE: demotes a cached diagnostic citing a line past the file's current EOF", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-past-eof-"));
+			try {
+				const filePath = path.join(cwd, "kilo.ts");
+				// 6 addressable lines on disk — the widget cache still carries a
+				// diagnostic citing line 407, exactly #1641's forensic shape (a
+				// stale in-memory LSP document that never touched this file's mtime).
+				fs.writeFileSync(filePath, "a\nb\nc\nd\ne\n");
+				mockSummaries.length = 0;
+				mockSummaries.push(
+					sum(
+						filePath,
+						{ blocking: 1, errors: 1 },
+						{
+							diagnostics: [
+								{
+									severity: "error",
+									semantic: "blocking",
+									message: "stale in-memory citation",
+									line: 407,
+									rule: "X",
+								},
+							],
+						},
+					),
+				);
+
+				const result = await run(makeTool(), { mode: "all" }, cwd);
+				const text = String(result.content[0].text);
+				// Pre-fix: served verbatim as "L407" and counted as a 🔴 blocker.
+				expect(text).not.toContain("L407");
+				expect(text).toContain("— line past EOF");
+				expect(text).not.toContain("🔴");
+				expect(resyncDocumentOnPastEofMock).toHaveBeenCalledWith(filePath);
+			} finally {
+				removeTempDirSync(cwd);
+			}
+		});
+
+		it("does not touch a diagnostic whose cited line is still within the current file", async () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-eof-ok-"));
+			try {
+				const filePath = path.join(cwd, "fine.ts");
+				fs.writeFileSync(filePath, "a\nb\nc\nd\ne\n");
+				mockSummaries.length = 0;
+				mockSummaries.push(
+					sum(
+						filePath,
+						{ blocking: 1, errors: 1 },
+						{
+							diagnostics: [
+								{
+									severity: "error",
+									semantic: "blocking",
+									message: "real, current error",
+									line: 5,
+									rule: "X",
+								},
+							],
+						},
+					),
+				);
+
+				const result = await run(makeTool(), { mode: "all" }, cwd);
+				const text = String(result.content[0].text);
+				expect(text).toContain("L5");
+				expect(text).toContain("🔴");
+				expect(resyncDocumentOnPastEofMock).not.toHaveBeenCalled();
+			} finally {
+				removeTempDirSync(cwd);
+			}
+		});
+
+		it("F5: a rule-policy-disabled past-EOF finding is dropped before the gate runs — no resync, no telemetry", async () => {
+			// Gate order matters: a finding the `.pi-lens.json` rule policy already
+			// dropped is not being served to the agent, so it must never trigger a
+			// resync or a `diagnostic_past_eof` record on THIS call — those are
+			// side effects reserved for findings that are actually delivered.
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-diag-eof-policy-"));
+			try {
+				fs.writeFileSync(
+					path.join(cwd, ".pi-lens.json"),
+					JSON.stringify({ rules: { "no-eval": { disable: ["no-eval"] } } }),
+				);
+				resetProjectLensConfigCache();
+				const filePath = path.join(cwd, "policy-dropped.ts");
+				fs.writeFileSync(filePath, "a\nb\n"); // 3 addressable lines
+				mockSummaries.length = 0;
+				mockSummaries.push(
+					sum(
+						filePath,
+						{ blocking: 1, errors: 1 },
+						{
+							diagnostics: [
+								{
+									severity: "error",
+									semantic: "blocking",
+									message: "MSG-NO-EVAL",
+									line: 999, // past EOF — would demote + resync if delivered
+									rule: "no-eval",
+									tool: "ast-grep",
+								},
+							],
+						},
+					),
+				);
+
+				const result = await run(makeTool(), { mode: "all" }, cwd);
+				const text = String(result.content[0].text);
+				expect(text).not.toContain("MSG-NO-EVAL");
+				expect(resyncDocumentOnPastEofMock).not.toHaveBeenCalled();
+			} finally {
+				resetProjectLensConfigCache();
+				removeTempDirSync(cwd);
+			}
+		});
+	});
+
 	it("filters ignored widget summaries in all mode (#279)", async () =>
 		withIgnoredFixture(async (cwd) => {
 			mockSummaries.push(
@@ -2104,6 +2508,38 @@ describe("lens_diagnostics mode=all", () => {
 			totalErrors: 3,
 			totalWarnings: 4,
 		});
+	});
+
+	// #1799: `semantic === "blocking"` iff `severity === "error"` holds
+	// codebase-wide, so every error-severity finding is ALSO a blocking one —
+	// the rendered summary must not print the same 3 findings once as
+	// "blocking" and again as "errors", which would read as 6 problems.
+	it("summary renders blocking count once, not doubled as a separate errors line (#1799)", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/a.ts", { blocking: 3, errors: 3 }));
+		const result = await run(makeTool(), { mode: "all" });
+		const text = String(result.content[0].text);
+		expect(text).toContain("3 blocking");
+		expect(text).not.toMatch(/\b3 errors?\b/);
+	});
+
+	// F1 regression (#1799 fix round): a #1631 dependency-drift demotion
+	// revokes an error's blocking authority (widget-state.ts `isBlocking`
+	// returns false for any stale entry) while `countDiagnostics` keeps it in
+	// the error tally (unlike a past-eof demotion) — so this file summarizes
+	// to blocking: 0, errors: 3 by design, a real disagreement between the two
+	// totals, not a double count. The summary must still surface it instead of
+	// reporting "no issues" — same reasoning as the per-file row's own
+	// `s.errors > 0 && s.blocking === 0` guard.
+	it("summary surfaces drift-demoted errors when blocking is 0, instead of reporting clean (#1799 F1)", async () => {
+		mockSummaries.length = 0;
+		mockSummaries.push(sum("/proj/a.ts", { blocking: 0, errors: 3 }));
+		const result = await run(makeTool(), { mode: "all" });
+		const text = String(result.content[0].text);
+		expect(text).toContain("3 errors");
+		expect(text).not.toContain("No issues");
+		expect(text).not.toContain("✓");
+		expect(result.details).toMatchObject({ totalBlocking: 0, totalErrors: 3 });
 	});
 
 	// ── actual-message exposure (the point of the tool) ───────────────────────────
@@ -2730,6 +3166,84 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 		expect(after.details).toMatchObject({ mode: "delta" });
 	});
 
+	// #1634 review round: mode=delta is the tool's DEFAULT and re-serves the
+	// actionable/quality-warnings caches verbatim — same shape #1622 fixed for
+	// gitleaks/trivy-secrets, previously unfixed here.
+	it("mode=delta demotes an actionable-warning cited in a file edited after the report was generated", async () => {
+		const filePath = path.join(ddTmp, "drift.ts");
+		fs.writeFileSync(filePath, "const a = 1;\nconst target = bad();\n");
+		const generatedAt = new Date(Date.now() - 5 * 60_000).toISOString();
+		// Edit happened AFTER the report — the cited line 2 is no longer trustworthy.
+		fs.utimesSync(filePath, new Date(), new Date());
+		const cacheData = {
+			"actionable-warnings": {
+				generatedAt,
+				files: [
+					{
+						filePath,
+						displayPath: "drift.ts",
+						warnings: [
+							{
+								id: "1",
+								filePath,
+								displayPath: "drift.ts",
+								line: 2,
+								severity: "warning",
+								tool: "eslint",
+								rule: "no-bad",
+								message: "bad call",
+								actions: [],
+								suppressed: false,
+								origin: "dispatch",
+							},
+						],
+					},
+				],
+			},
+		};
+
+		const result = await run(makeTool(cacheData), { mode: "delta" }, ddTmp);
+		const text = String(result.content[0].text);
+		expect(text).toContain("bad call");
+		expect(text).not.toContain("L2");
+		expect(text).toContain("stale — re-run to confirm");
+	});
+
+	it("mode=delta drops an actionable-warning whose cited file no longer exists", async () => {
+		const filePath = path.join(ddTmp, "gone.ts");
+		const generatedAt = new Date().toISOString();
+		const cacheData = {
+			"actionable-warnings": {
+				generatedAt,
+				files: [
+					{
+						filePath,
+						displayPath: "gone.ts",
+						warnings: [
+							{
+								id: "1",
+								filePath,
+								displayPath: "gone.ts",
+								line: 1,
+								severity: "warning",
+								tool: "eslint",
+								rule: "no-bad",
+								message: "vanished finding",
+								actions: [],
+								suppressed: false,
+								origin: "dispatch",
+							},
+						],
+					},
+				],
+			},
+		};
+
+		const result = await run(makeTool(cacheData), { mode: "delta" }, ddTmp);
+		const text = String(result.content[0].text);
+		expect(text).not.toContain("vanished finding");
+	});
+
 	it("mode=all hides a finding deferred via the mark tool without a re-dispatch", async () => {
 		const filePath = path.join(ddTmp, "b.ts");
 		fs.writeFileSync(filePath, "const target = bad();\n");
@@ -2802,5 +3316,100 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 		};
 		const after = await run(makeTool({}, lspService), { mode: "full" }, ddTmp);
 		expect(String(after.content[0].text)).not.toContain("bad call");
+	});
+});
+
+// ── #1777 severity tiers ──────────────────────────────────────────────────────
+
+// #1777 fix-round F1: `summarizeDiagnostics` tallied `error` and `warning`
+// only, the same shape `clients/widget-state.ts` carried. Once the dispatch
+// path stopped collapsing hint and info into warning, a hint-only file scored
+// 0/0/0 here, the `withIssues` filter dropped it, and mode=full rendered
+// "No issues across 1 file ✓" while its own `details` still carried the
+// diagnostic. mode=all reads widget-state's tally and disagreed.
+describe("lens_diagnostics counts hint-tier findings (#1777)", () => {
+	it("mode=full does not report a hint-only file as clean, and mode=all agrees", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/hinted.ts",
+					count: 1,
+					diagnostics: [
+						{
+							// LSP severity 4 is `hint` — what the ast-grep auxiliary
+							// server emits for a hint-tier rule.
+							severity: 4,
+							message: "prefer a narrower type",
+							range: {
+								start: { line: 1, character: 0 },
+								end: { line: 1, character: 5 },
+							},
+							source: "ast-grep",
+							code: "no-any-type",
+						},
+					],
+				},
+			]),
+		};
+		const full = await run(makeTool({}, lspService), { mode: "full" });
+		const fullText = String(full.content[0].text);
+
+		expect(fullText).not.toMatch(/No .*issues across/);
+		expect(fullText).toContain("hinted.ts");
+		expect(fullText).toContain("prefer a narrower type");
+
+		// mode=all reads widget-state's own tally. Build its summary from the REAL
+		// widget-state module (this suite mocks it) so the two modes are compared
+		// against ONE tally implementation rather than a hand-written stand-in.
+		const widget = await vi.importActual<
+			typeof import("../../clients/widget-state.js")
+		>("../../clients/widget-state.js");
+		widget.clearWidgetState();
+		widget.recordDiagnostics("/proj/src/hinted.ts", [
+			{
+				severity: "hint",
+				semantic: "warning",
+				message: "prefer a narrower type",
+				line: 2,
+				tool: "ast-grep",
+			},
+		]);
+		mockSummaries.push(...widget.getFileDiagnosticSummaries());
+
+		const all = await run(makeTool({}, lspService), { mode: "all" });
+		const allText = String(all.content[0].text);
+		expect(allText).not.toMatch(/No .*issues across/);
+		expect(allText).toContain("hinted.ts");
+	});
+
+	// The tally widens, the `severity: "error"` filter does not: a hint is still
+	// not an error. Guards against over-widening `withIssues` into "everything
+	// counts".
+	it("keeps a hint-only file out of the severity=error view", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{
+					filePath: "/proj/src/hinted.ts",
+					count: 1,
+					diagnostics: [
+						{
+							severity: 4,
+							message: "prefer a narrower type",
+							range: {
+								start: { line: 1, character: 0 },
+								end: { line: 1, character: 5 },
+							},
+							source: "ast-grep",
+							code: "no-any-type",
+						},
+					],
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), {
+			mode: "full",
+			severity: "error",
+		});
+		expect(String(result.content[0].text)).toContain("No error issues across");
 	});
 });

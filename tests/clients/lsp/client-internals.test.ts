@@ -5,19 +5,21 @@
  * directly with mock LSPClientState to avoid spawning real language servers.
  */
 
-import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import type { MessageConnection } from "vscode-jsonrpc";
-
 // #1639: capture `lsp_typescript_diagnostic_sequence` phase records so the
 // pull-settle regression tests below can assert on durationMs/version/
 // settleSource without spinning up a real logging sink.
-const { pullSequenceEvents } = vi.hoisted(() => ({
+//
+// #1641 F4: ALSO record every logLatency call (any phase) into
+// `logLatencyMock` so `recordSentContent`'s `lsp_document_send` calls are
+// inspectable too, without needing the real (test-mode-suppressed) writer.
+const { pullSequenceEvents, logLatencyMock } = vi.hoisted(() => ({
 	pullSequenceEvents: [] as Array<Record<string, unknown>>,
+	logLatencyMock: vi.fn(),
 }));
 vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
 	const actual =
@@ -25,6 +27,7 @@ vi.mock("../../../clients/latency-logger.js", async (importOriginal) => {
 	return {
 		...actual,
 		logLatency: vi.fn((event: Record<string, unknown>) => {
+			logLatencyMock(event);
 			if (event.phase === "lsp_typescript_diagnostic_sequence") {
 				pullSequenceEvents.push(event);
 			}
@@ -44,6 +47,7 @@ import {
 	diagnosticsVersionForPath,
 	normalizeClientWorkspaceEdit,
 	handleNotifyChange,
+	handleNotifyExternalChange,
 	navRequest,
 	resolveConfigurationSection,
 	runServerCommand,
@@ -55,8 +59,13 @@ import {
 } from "../../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
-import { WatchedFilesQueue } from "../../../clients/lsp/watch-queue.js";
 import { applyWorkspaceEdit } from "../../../clients/lsp/edits.js";
+// #1667: the LSPClientState fixture moved to a shared module so the
+// multi-identifier pull tests reuse it instead of maintaining a copy.
+import {
+	createMockLspProcess,
+	createMockState,
+} from "./mock-client-state.js";
 
 const TEST_FILE = "/project/app.ts";
 const TEST_KEY = normalizeMapKey(TEST_FILE);
@@ -392,112 +401,6 @@ describe("workDoneProgress capability (#974)", () => {
 	});
 });
 
-function createMockConnection(): MessageConnection {
-	return {
-		sendNotification: vi.fn().mockResolvedValue(undefined),
-		sendRequest: vi.fn().mockResolvedValue(undefined),
-		onNotification: vi.fn(),
-		onRequest: vi.fn().mockResolvedValue(undefined),
-		onError: vi.fn(),
-		onClose: vi.fn(),
-		listen: vi.fn(),
-		dispose: vi.fn(),
-	} as unknown as MessageConnection;
-}
-
-function createMockLspProcess() {
-	return {
-		pid: 12345,
-		process: { killed: false, kill: vi.fn() } as unknown as NodeJS.Process,
-		stdin: {
-			on: vi.fn(),
-			off: vi.fn(),
-			write: vi.fn(),
-		} as unknown as NodeJS.WritableStream,
-		stdout: {
-			on: vi.fn(),
-			off: vi.fn(),
-			pipe: vi.fn(),
-		} as unknown as NodeJS.ReadableStream,
-		stderr: { on: vi.fn(), off: vi.fn() } as unknown as NodeJS.ReadableStream,
-	};
-}
-
-function createMockState(overrides?: Partial<LSPClientState>): LSPClientState {
-	const diagnosticEmitter = new EventEmitter();
-	diagnosticEmitter.setMaxListeners(50);
-	const state: LSPClientState = {
-		isConnected: true,
-		isDestroyed: false,
-		shutdownRequested: false,
-		exitedAt: undefined,
-		connectionDisposed: false,
-		lastError: undefined,
-		connection: createMockConnection(),
-		pushDiagnostics: new Map(),
-		pushDiagnosticTimestamps: new Map(),
-		documentPullDiagnostics: new Map(),
-		documentPullDiagnosticTimestamps: new Map(),
-		pullFailureHistory: [],
-		pendingDiagnostics: new Map(),
-		diagnosticPublicationCounts: new Map(),
-		documentOpenedAt: new Map(),
-		diagnosticEmitter,
-		diagnosticsVersion: 0,
-		diagnosticsVersionsByPath: new Map(),
-		documentVersions: new Map(),
-		diagnosticDocVersions: new Map(),
-		documentContentHashes: new Map(),
-		diagnosticBindings: new Map(),
-		pullResultIds: new Map(),
-		workspacePullResultCache: new Map(),
-		openDocuments: new Set(),
-		closedDocuments: new Set(),
-		pendingOpens: new Set(),
-		workspaceDiagnosticsSupport: {
-			advertised: false,
-			mode: "push-only",
-			workspaceDiagnostics: false,
-			diagnosticProviderKind: "none",
-		},
-		operationSupport: {
-			definition: false,
-			typeDefinition: false,
-			declaration: false,
-			references: false,
-			hover: false,
-			signatureHelp: false,
-			documentSymbol: false,
-			workspaceSymbol: false,
-			codeAction: false,
-			rename: false,
-			implementation: false,
-			callHierarchy: false,
-		},
-		staticDiagnosticsMode: "push-only",
-		positionEncoding: "utf-16",
-		dynamicRegistrations: new Map(),
-		advertisedCommands: new Set(),
-		serverEditsAllowed: 0,
-		serverId: "test-server",
-		root: "/project",
-		lspProcess: createMockLspProcess() as any,
-		watchQueue: undefined as unknown as WatchedFilesQueue,
-		...overrides,
-	};
-	// #271: mirror production — the queue flushes a batched didChangeWatchedFiles
-	// through the (mock) connection. Tests drive it via state.watchQueue.flush().
-	if (!state.watchQueue) {
-		state.watchQueue = new WatchedFilesQueue((changes) => {
-			void state.connection.sendNotification(
-				"workspace/didChangeWatchedFiles",
-				{ changes },
-			);
-		});
-	}
-	return state;
-}
-
 describe("resolveConfigurationSection (#983)", () => {
 	const initialization = {
 		scan: { configuration: ["auto"], onlyGitDirty: false, jobs: 16 },
@@ -671,6 +574,30 @@ describe("handleNotifyOpen", () => {
 		const didOpenCall = calls.find((c) => c[0] === "textDocument/didOpen");
 		expect(didOpenCall).toBeDefined();
 		expect(state.openDocuments.has(TEST_KEY)).toBe(true);
+	});
+
+	it("#1641 F4: lsp_document_send's contentLineCount matches the gate's LSP-addressable convention (newlines + 1), not wc -l", async () => {
+		logLatencyMock.mockClear();
+		const state = createMockState();
+		await handleNotifyOpen(state, TEST_FILE, "a\nb\nc\n", "typescript"); // 3 newlines
+
+		const sendCall = logLatencyMock.mock.calls.find(
+			(c) => c[0]?.phase === "lsp_document_send",
+		);
+		expect(sendCall).toBeDefined();
+		expect(sendCall?.[0].metadata.contentLineCount).toBe(4);
+		expect(sendCall?.[0].metadata.contentLength).toBe(6);
+	});
+
+	it("#1641 F4: an empty document logs contentLineCount 1, not 0 (a doc always has ≥1 addressable line)", async () => {
+		logLatencyMock.mockClear();
+		const state = createMockState();
+		await handleNotifyOpen(state, TEST_FILE, "", "typescript");
+
+		const sendCall = logLatencyMock.mock.calls.find(
+			(c) => c[0]?.phase === "lsp_document_send",
+		);
+		expect(sendCall?.[0].metadata.contentLineCount).toBe(1);
 	});
 
 	it("detaches the classic TypeScript projectInfo probe after didOpen", async () => {
@@ -927,6 +854,81 @@ describe("handleNotifyOpen", () => {
 		await handleNotifyOpen(state, TEST_FILE, "const x = 1;", "typescript");
 
 		expect(state.pushDiagnostics.has(TEST_KEY)).toBe(false);
+	});
+});
+
+/**
+ * #1668 — external (bash-authored) file changes that never went through
+ * textDocument/didOpen/didChange. Reproduces the server-side stale view: a
+ * bash-deleted file left NO trace in the fixture client's outbound traffic
+ * before this fix (`handleNotifyExternalChange` did not exist), so a server
+ * given only didOpen/didChange would keep the file in its index/vfs forever.
+ */
+describe("handleNotifyExternalChange (#1668)", () => {
+	it("queues a type-3 (Deleted) change and flushes it as one notification", () => {
+		const state = createMockState();
+		handleNotifyExternalChange(state, TEST_FILE, 3);
+
+		// Not on the wire yet — routed through the #271 debounce queue.
+		let calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		expect(calls.some((c) => c[0] === "workspace/didChangeWatchedFiles")).toBe(
+			false,
+		);
+		expect(state.watchQueue.size).toBe(1);
+
+		state.watchQueue.flush();
+		calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const watched = calls.find((c) => c[0] === "workspace/didChangeWatchedFiles");
+		expect(watched).toBeDefined();
+		const changes = (watched?.[1] as { changes: Array<{ uri: string; type: number }> })
+			.changes;
+		expect(changes).toEqual([
+			{ uri: pathToFileURL(TEST_FILE).href, type: 3 },
+		]);
+	});
+
+	it("a burst of N distinct external deletes coalesces into ONE flush (flood control)", () => {
+		const state = createMockState();
+		const files = Array.from({ length: 25 }, (_, i) => `/project/gen-${i}.ts`);
+		for (const f of files) handleNotifyExternalChange(state, f, 3);
+
+		expect(state.watchQueue.size).toBe(25);
+		expect(state.connection.sendNotification).not.toHaveBeenCalledWith(
+			"workspace/didChangeWatchedFiles",
+			expect.anything(),
+		);
+
+		state.watchQueue.flush();
+		const watchedCalls = vi
+			.mocked(state.connection.sendNotification)
+			.mock.calls.filter((c) => c[0] === "workspace/didChangeWatchedFiles");
+		expect(watchedCalls).toHaveLength(1);
+		expect(
+			(watchedCalls[0][1] as { changes: unknown[] }).changes,
+		).toHaveLength(25);
+	});
+
+	it("uses the tracked open-document URI when the path is already open", () => {
+		const state = createMockState({ openDocumentUris: new Map() });
+		const uri = "file:///project/app.ts?variant=1";
+		state.openDocumentUris?.set(TEST_KEY, uri);
+
+		handleNotifyExternalChange(state, TEST_FILE, 1);
+		state.watchQueue.flush();
+
+		const calls = vi.mocked(state.connection.sendNotification).mock.calls;
+		const watched = calls.find((c) => c[0] === "workspace/didChangeWatchedFiles");
+		expect((watched?.[1] as { changes: Array<{ uri: string }> }).changes).toEqual(
+			[{ uri, type: 1 }],
+		);
+	});
+
+	it("does nothing when the client is not alive", () => {
+		const state = createMockState({ isConnected: false });
+		handleNotifyExternalChange(state, TEST_FILE, 3);
+
+		expect(state.watchQueue.size).toBe(0);
+		expect(state.connection.sendNotification).not.toHaveBeenCalled();
 	});
 });
 
@@ -1634,9 +1636,17 @@ describe("publishDiagnostics handler — superseded push guard (cache-poisoning 
 			);
 			expect(unsettled.settledReturn).toBe(false);
 			expect(unsettled.settleSource).toBe("publication");
+			expect(unsettled).toMatchObject({
+				serverId: "typescript",
+				outcome: "published",
+			});
 			expect(pullSequenceEvents[0].durationMs).toBe(0);
 			expect(settled.settledReturn).toBe(true);
 			expect(settled.settleSource).toBe("quiet-window");
+			expect(settled).toMatchObject({
+				serverId: "typescript",
+				outcome: "settled",
+			});
 		});
 
 		it("a first-push settle's durationMs is 0 (no debounce wait), not document age", async () => {
@@ -1820,6 +1830,10 @@ describe("logTypeScriptPullSettle — pull-settle record shape (#1639)", () => {
 		// nowhere near the 90s document age.
 		expect(event.durationMs as number).toBeLessThan(1000);
 		const metadata = event.metadata as Record<string, unknown>;
+		expect(metadata).toMatchObject({
+			serverId: "typescript",
+			outcome: "settled",
+		});
 		// The document age is still recorded, honestly named, in metadata.
 		expect(metadata.elapsedSinceDidOpenMs as number).toBeGreaterThanOrEqual(
 			89_000,
@@ -2487,7 +2501,9 @@ describe("runServerCommand — executeCommand timeout backstop (#365)", () => {
 describe("applyDynamicCapabilities", () => {
 	it("upgrades to pull mode when textDocument/diagnostic is registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("diag-1", "textDocument/diagnostic");
+		state.dynamicRegistrations.set("diag-1", {
+			method: "textDocument/diagnostic",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2500,7 +2516,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("upgrades to pull mode when workspace/diagnostic is registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("ws-diag-1", "workspace/diagnostic");
+		state.dynamicRegistrations.set("ws-diag-1", {
+			method: "workspace/diagnostic",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2509,7 +2527,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("reverts to push-only when dynamic pull registration is removed", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("diag-1", "textDocument/diagnostic");
+		state.dynamicRegistrations.set("diag-1", {
+			method: "textDocument/diagnostic",
+		});
 		applyDynamicCapabilities(state);
 		expect(state.workspaceDiagnosticsSupport.mode).toBe("pull");
 
@@ -2541,9 +2561,15 @@ describe("applyDynamicCapabilities", () => {
 
 	it("upgrades operation capabilities when methods are registered", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("def-1", "textDocument/definition");
-		state.dynamicRegistrations.set("ref-1", "textDocument/references");
-		state.dynamicRegistrations.set("hover-1", "textDocument/hover");
+		state.dynamicRegistrations.set("def-1", {
+			method: "textDocument/definition",
+		});
+		state.dynamicRegistrations.set("ref-1", {
+			method: "textDocument/references",
+		});
+		state.dynamicRegistrations.set("hover-1", {
+			method: "textDocument/hover",
+		});
 
 		applyDynamicCapabilities(state);
 
@@ -2578,7 +2604,9 @@ describe("applyDynamicCapabilities", () => {
 
 	it("ignores unknown registration methods without throwing", () => {
 		const state = createMockState();
-		state.dynamicRegistrations.set("unknown-1", "some/unknownMethod");
+		state.dynamicRegistrations.set("unknown-1", {
+			method: "some/unknownMethod",
+		});
 
 		expect(() => applyDynamicCapabilities(state)).not.toThrow();
 		expect(state.workspaceDiagnosticsSupport.mode).toBe("push-only");
@@ -2623,6 +2651,7 @@ describe("clientRequestWorkspaceDiagnostics — real report parsing", () => {
 		expect(state.connection.sendRequest).toHaveBeenCalledWith(
 			"workspace/diagnostic",
 			{ previousResultIds: [] },
+			expect.anything(),
 		);
 		expect(out).toBeDefined();
 		const byName = (name: string) =>

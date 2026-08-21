@@ -32,6 +32,7 @@ import {
 	toRunnerDisplayPath,
 } from "./dispatch/runner-context.js";
 import { getKnipIgnorePatterns } from "./file-utils.js";
+import { formatCacheAgeLabel } from "./finding-delivery-gate.js";
 import {
 	getFullScanWallClockMs,
 	isWorkspaceSweepActive,
@@ -66,7 +67,10 @@ import {
 import { deadCodeIssueToProjectDiagnostic } from "./project-diagnostics/runner-adapters/dead-code.js";
 import { gitleaksFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/gitleaks.js";
 import { govulncheckFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/govulncheck.js";
-import { trivyFindingToProjectDiagnostic } from "./project-diagnostics/runner-adapters/trivy.js";
+import {
+	trivyFindingToProjectDiagnostic,
+	trivySecretFindingToProjectDiagnostic,
+} from "./project-diagnostics/runner-adapters/trivy.js";
 import { knipIssuesToProjectDiagnostics } from "./project-diagnostics/runner-adapters/knip.js";
 import type { ProjectDiagnostic } from "./project-diagnostics/types.js";
 import { applyDispositionsMultiFile } from "./diagnostic-dispositions.js";
@@ -88,12 +92,16 @@ import {
 	gateFindingsByPathFreshness,
 	snapshotAdvisoryProvenance,
 } from "./advisory-provenance.js";
-
-/**
- * #1622 / #1419 precedent: what a demoted finding shows where its cached line
- * number used to be. The finding survives, the untrustworthy coordinate does not.
- */
-const STALE_LINE_MARKER = "[stale — re-run to confirm]";
+import { sweepInlineBlockerFreshness } from "./blocker-freshness.js";
+import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
+// #1631 review V2: moved to its own leaf module so a low-level store
+// (widget-state.ts) can use the marker without importing this orchestrator —
+// see clients/stale-marker.ts's doc comment.
+import { STALE_LINE_MARKER } from "./stale-marker.js";
+import {
+	getWidgetBlockingFilesForSweep,
+	markWidgetFileBlockersStale,
+} from "./widget-state.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
 
 interface TurnEndDeps {
@@ -487,14 +495,78 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const projectDiagnosticsDelta: ProjectDiagnostic[] = [];
 	const projectDiagnosticsSources = new Set<string>();
 
+	// #1641: past-EOF gate. Runs BEFORE the dependency-drift sweep below — a
+	// cheap statSync per cited file is worth paying first so the pricier
+	// import-parsing sweep can skip anything already taken out of the
+	// authoritative channel this turn (see blocker-past-eof.ts's module doc
+	// for the full composition rule with #1631's gate).
+	const blockerPastEofStart = Date.now();
+	const blockerPastEof = sweepInlineBlockerPastEof(runtime, cwd);
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "blocker_past_eof_sweep",
+		durationMs: Date.now() - blockerPastEofStart,
+		metadata: {
+			total: blockerPastEof.total,
+			checked: blockerPastEof.checked,
+			demoted: blockerPastEof.demoted,
+			healed: blockerPastEof.healed,
+		},
+	});
+
+	// #1631: freshness gate. A cached blocker is a verdict about the file AND
+	// everything it imports; before re-serving it, sweep for out-of-band drift of
+	// the file or its forward imports and demote drifted entries to a
+	// `[stale — re-run to confirm]` advisory instead of re-asserting them at full
+	// authority (#1419 demote-not-drop).
+	const blockerFreshnessStart = Date.now();
+	// #1790: widen the sweep's population with widget-store rows a cache-served
+	// replay populated without ever touching RuntimeCoordinator's inline-blocker
+	// map — see blocker-freshness.ts's `WidgetSweepBlockerEntry` doc for why this
+	// is injected here rather than imported by blocker-freshness.ts itself.
+	const blockerFreshness = await sweepInlineBlockerFreshness(runtime, cwd, {
+		additionalEntries: getWidgetBlockingFilesForSweep().map((row) => ({
+			filePath: row.filePath,
+			recordedAtMs: row.recordedAtMs,
+			demote: () => markWidgetFileBlockersStale(row.filePath, "dependency-drift"),
+		})),
+	});
+	logLatency({
+		type: "phase",
+		toolName: "turn_end",
+		filePath: cwd,
+		phase: "blocker_freshness_sweep",
+		durationMs: Date.now() - blockerFreshnessStart,
+		metadata: {
+			total: blockerFreshness.total,
+			kept: blockerFreshness.kept,
+			revalidated: blockerFreshness.revalidated,
+			alreadyStale: blockerFreshness.alreadyStale,
+			truncatedImports: blockerFreshness.truncatedImports,
+		},
+	});
+
 	// Re-surface inline blockers from this turn that the agent didn't fix.
 	// These were shown inline during write/edit but the agent moved on without resolving them.
 	const unresolvedBlockers = runtime.getInlineBlockersSnapshot();
-	for (const { filePath: bPath, summary } of unresolvedBlockers) {
+	for (const { filePath: bPath, summary, stale } of unresolvedBlockers) {
 		const displayPath = toRunnerDisplayPath(cwd, bPath);
-		blockerParts.push(
-			`Unresolved from this turn — ${displayPath}:\n${summary}`,
-		);
+		if (stale) {
+			// #1631: demoted — out of the authoritative blocker channel and into the
+			// advisory channel with a stale marker, so the agent is told to re-run
+			// rather than pressured by a verdict that may already be resolved.
+			// @delivery-surface: runtime-turn:unresolved-inline-blocker
+			advisoryParts.push(
+				`${STALE_LINE_MARKER} ${displayPath}:\n${summary}`,
+			);
+		} else {
+			// @delivery-surface: runtime-turn:unresolved-inline-blocker
+			blockerParts.push(
+				`Unresolved from this turn — ${displayPath}:\n${summary}`,
+			);
+		}
 	}
 
 	// Drain the deferred cascade computes kicked off this turn (#450). They ran
@@ -679,6 +751,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		}
 		if (parts.length > 0) {
 			const section = parts.join("\n\n");
+			// @delivery-surface: runtime-turn:cascade-blocker
 			blockerParts.push(section);
 			// #1446 item 1: proves the cascade section reached `blockerParts` —
 			// i.e. it was QUEUED for persistence into the turn-end advisory — not
@@ -808,6 +881,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					? "changed file not in the review graph"
 					: "review graph unavailable",
 		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (graphAdvisory) advisoryParts.push(graphAdvisory);
 
 		const bindingAdvisory = buildAdvisory(bindingRuns, {
@@ -817,6 +891,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`cascade result does not cover them.`,
 			fallbackDetail: () => "cascade diagnostics withheld (binding rejected)",
 		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (bindingAdvisory) advisoryParts.push(bindingAdvisory);
 
 		const budgetAdvisory = buildAdvisory(budgetRuns, {
@@ -833,6 +908,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					: detail;
 			},
 		});
+		// @delivery-surface: runtime-turn:cascade-coverage-advisory
 		if (budgetAdvisory) advisoryParts.push(budgetAdvisory);
 
 		const fileCount = new Set(
@@ -902,6 +978,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	const t2 = Date.now();
 	let knipMeta: {
 		skipped?: boolean;
+		execution?: "executed" | "cache";
 		success?: boolean;
 		totalIssues?: number;
 		newIssues?: number;
@@ -936,7 +1013,9 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 			knipMeta = { skipped: true, reason: prevKnip.data.summary };
 		} else {
-			const knipResult = await knipClient.analyze(cwd, getKnipIgnorePatterns());
+			const knipResult = await knipClient.analyze(cwd, getKnipIgnorePatterns(), {
+				projectSeq: runtime.projectSeq,
+			});
 			// Never overwrite a good scan with a failure (#925, #1467): the last
 			// good result stays until a new successful scan replaces it.
 			const knipWouldPoison = wouldPoisonCache(prevKnip, knipResult);
@@ -948,6 +1027,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				cacheManager.writeCache("knip", knipResult, cwd);
 			}
 			knipMeta = {
+				execution: knipResult.execution ?? "executed",
 				success: knipResult.success,
 				totalIssues: knipResult.issues.length,
 				newIssues: 0,
@@ -999,6 +1079,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					if (firstPath) {
 						report += `  First location: ${firstPath}\n`;
 					}
+					// @delivery-surface: runtime-turn:knip-blocker
 					blockerParts.push(report);
 				}
 
@@ -1022,6 +1103,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							: "(unknown)";
 						report += `  ${display}${issue.line ? `:${issue.line}` : ""} — ${issue.name}\n`;
 					}
+					// @delivery-surface: runtime-turn:knip-advisory
 					advisoryParts.push(report);
 				}
 			}
@@ -1163,6 +1245,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						),
 					);
 					projectDiagnosticsSources.add("dead-code");
+					// @delivery-surface: runtime-turn:dead-code-advisory
 					advisoryParts.push(formatDeadCodeDelta(newIssues, result.language));
 				} catch (err) {
 					dbg(`turn_end: dead-code(${client.id}) failed: ${err}`);
@@ -1257,6 +1340,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (govFindings.length > findings.length) {
 			report += `  … and ${govFindings.length - findings.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:govulncheck-advisory
 		advisoryParts.push(report);
 	}
 
@@ -1314,10 +1398,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// there — a suppression escape (and a double count against
 	// `dispositionSuppressedTotal`) that a live-only filter would have missed.
 	//
-	// Trivy-secret findings are NOT yet wired — they have no existing
-	// lens_diagnostics-surfaced identity to anchor against (only the
-	// CVE-scanning trivy lane does); re-homed as a follow-up (#1628) rather
-	// than inventing an unreviewed anchor shape under release time pressure.
+	// #1628: trivy-secret findings get the SAME treatment, now that
+	// `trivySecretFindingToProjectDiagnostic` (project-diagnostics/runner-
+	// adapters/trivy.ts) gives them a `lens_diagnostics`-surfaced identity
+	// (tool="trivy", rule="trivy-secret:<ruleId>") to anchor a mark against —
+	// same pattern as gitleaks above, applied to both the live and stale arms
+	// for the same reason.
+	//
 	// ast-grep secret findings need no filtering here — they already went
 	// through dispatch's applyDispositions before reaching
 	// `peekActionableWarnings()`.
@@ -1335,12 +1422,26 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		"gitleaks",
 		gitleaksLiveFiltered.suppressed + gitleaksStaleFiltered.suppressed,
 	);
+	const trivySecretsLiveFiltered = filterFindingsByDisposition(
+		trivySecretsGate.live,
+		cwd,
+		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
+	);
+	const trivySecretsStaleFiltered = filterFindingsByDisposition(
+		trivySecretsGate.stale,
+		cwd,
+		(f) => trivySecretFindingToProjectDiagnostic(cwd, f),
+	);
+	recordDispositionSuppressed(
+		"trivy-secrets",
+		trivySecretsLiveFiltered.suppressed + trivySecretsStaleFiltered.suppressed,
+	);
 	const astSecretWarnings = runtime
 		.peekActionableWarnings()
 		.filter(isSecretWarning);
 	const sessionSecrets = dedupeSecretFindings([
 		...fromGitleaks(gitleaksLiveFiltered.kept),
-		...fromTrivySecrets(trivySecretsGate.live),
+		...fromTrivySecrets(trivySecretsLiveFiltered.kept),
 	]);
 	// Demoted secrets are addressed by FILE, never by line — the line is the one
 	// field the edit invalidated. Rule id and source survive it and must be
@@ -1354,7 +1455,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			rule: f.ruleId,
 			source: "gitleaks",
 		})),
-		...trivySecretsGate.stale.map((f) => ({
+		...trivySecretsStaleFiltered.kept.map((f) => ({
 			file: toRunnerDisplayPath(cwd, f.file),
 			rule: f.ruleId,
 			source: "trivy",
@@ -1390,6 +1491,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (enriched.length > shown.length) {
 			report += `  … and ${enriched.length - shown.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:secrets-gitleaks,runtime-turn:secrets-trivy
 		blockerParts.push(report);
 	}
 	if (staleSecrets.length) {
@@ -1408,6 +1510,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (staleSecrets.length > shown.length) {
 			report += `  … and ${staleSecrets.length - shown.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:stale-secrets-tier
 		staleSecretParts.push(report);
 	}
 
@@ -1415,6 +1518,19 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// CRITICAL is a blocker (a known-exploitable CVE in a shipped dep is real
 	// production risk); HIGH/MEDIUM/LOW are advisory. The agent gets the upgrade
 	// target as a hint and decides — we never auto-edit lockfiles.
+	//
+	// #1634: these three trivy reports (critical blocker, non-critical
+	// advisory, license advisory below) name a PACKAGE, not a file:line — there
+	// is no cited path for `gateFindingsByPathFreshness` to stat, so unlike the
+	// secrets/govulncheck stores above this store cannot be freshness-GATED.
+	// It is the delivery gate's explicit-label escape hatch instead
+	// (`clients/finding-delivery-gate.ts`, surfaces `runtime-turn:trivy-*`):
+	// the session_start cache can be arbitrarily old, so its age is stated
+	// plainly rather than presenting a CRITICAL blocker as if it were current.
+	// This runs on top of (not instead of) #1625's disposition filter below —
+	// a suppressed finding never reaches this render at all, so the two only
+	// ever compose.
+	const trivyAgeLabel = formatCacheAgeLabel(trivyCacheEntry?.data?.scannedAt);
 	const trivyFindingsFiltered = filterFindingsByDisposition(
 		trivyCacheEntry?.data?.findings ?? [],
 		cwd,
@@ -1437,32 +1553,35 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (critical.length) {
 			const shown = critical.slice(0, 5);
 			let report =
-				"🔴 STOP — CRITICAL dependency CVEs (trivy). Upgrade before shipping:\n";
+				`🔴 STOP — CRITICAL dependency CVEs (trivy, ${trivyAgeLabel}). Upgrade before shipping:\n`;
 			for (const f of shown) report += fmt(f);
 			if (critical.length > shown.length) {
 				report += `  … and ${critical.length - shown.length} more\n`;
 			}
+			// @delivery-surface: runtime-turn:trivy-critical-blocker
 			blockerParts.push(report);
 		}
 		if (advisory.length) {
 			const shown = advisory.slice(0, 5);
-			let report = "🛡️ Dependency CVEs (trivy) — upgrade where possible:\n";
+			let report = `🛡️ Dependency CVEs (trivy, ${trivyAgeLabel}) — upgrade where possible:\n`;
 			for (const f of shown) report += fmt(f);
 			if (advisory.length > shown.length) {
 				report += `  … and ${advisory.length - shown.length} more\n`;
 			}
+			// @delivery-surface: runtime-turn:trivy-cve-advisory
 			advisoryParts.push(report);
 		}
 	}
 
 	// trivy — dependency license risk (#131 Mode 4). Advisory only: a copyleft /
 	// restricted license in a proprietary tree is a compliance signal, not a
-	// build break. Surfaced from the same cached `trivy fs` pass.
+	// build break. Surfaced from the same cached `trivy fs` pass — same #1634
+	// explicit-label rationale as the CVE reports above (no cited path to gate).
 	const licenses = trivyCacheEntry?.data?.licenses ?? [];
 	if (licenses.length) {
 		const shown = licenses.slice(0, 5);
 		let report =
-			"📜 Dependency license risk (trivy) — review for compliance:\n";
+			`📜 Dependency license risk (trivy, ${trivyAgeLabel}) — review for compliance:\n`;
 		for (const l of shown) {
 			const cat = l.category ? `, ${l.category}` : "";
 			report += `  ${l.pkgName} — ${l.license} (${l.severity}${cat})\n`;
@@ -1470,6 +1589,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		if (licenses.length > shown.length) {
 			report += `  … and ${licenses.length - shown.length} more\n`;
 		}
+		// @delivery-surface: runtime-turn:trivy-license-advisory
 		advisoryParts.push(report);
 	}
 
@@ -1482,6 +1602,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const byLane = Object.entries(dispositionSuppressedByLane)
 			.map(([lane, count]) => `${lane} ${count}`)
 			.join(", ");
+		// @delivery-surface: runtime-turn:disposition-suppressed-notice
 		advisoryParts.push(
 			`suppressed by disposition: ${dispositionSuppressedTotal} finding(s) ` +
 				`dropped from this turn's gitleaks/govulncheck/trivy sections (${byLane}) ` +
@@ -1830,6 +1951,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// into an authoritative-looking clean result for the rest of the file.
 			// Keep the limitation visible and require a complete graph for this
 			// user-facing impact surface (#1070).
+			// @delivery-surface: runtime-turn:call-graph-advisory
 			advisoryParts.push(
 				"Call-graph impact was not emitted because call-graph extraction coverage is incomplete; " +
 					"the affected files may have unreported callers.",
@@ -1888,6 +2010,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				}
 			}
 			if (impactLines.length > 0) {
+				// @delivery-surface: runtime-turn:call-graph-advisory
 				advisoryParts.push(
 					`📊 Call-graph impact (changed symbols have callers):\n${impactLines.join("\n")}`,
 				);
@@ -1973,6 +2096,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			writeActionableWarningsReport(cacheManager, cwd, report);
 			appendActionableWarningsHistory(cwd, report);
 			const advisory = formatActionableWarningsAdvisory(report);
+			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({
 				event: advisory ? "advisory_injected" : "advisory_skipped",
@@ -2021,6 +2145,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		writeCodeQualityWarningsReport(cacheManager, cwd, qualityReport);
 		appendCodeQualityWarningsHistory(cwd, qualityReport);
 		const advisory = formatCodeQualityWarningsAdvisory(qualityReport);
+		// @delivery-surface: runtime-turn:code-quality-warnings-advisory
 		if (advisory) advisoryParts.push(advisory);
 		logLatency({
 			type: "phase",

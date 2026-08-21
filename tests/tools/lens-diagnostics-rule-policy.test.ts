@@ -65,11 +65,23 @@ const mockSummaries: ReturnType<
 	typeof import("../../clients/widget-state.js")["getFileDiagnosticSummaries"]
 > = [];
 
-vi.mock("../../clients/widget-state.js", () => ({
-	getFileDiagnosticSummaries: () => mockSummaries,
-	reconcileStaleWidgetFiles: async () => 0,
-	reconcileScanDiagnostics: vi.fn(),
-}));
+// Spread the real module instead of hand-listing its exports. A full-replace
+// factory silently rots: `tools/lens-diagnostics.ts` imports a NEW widget-state
+// export and every test using this mock dies with "No <name> export is defined
+// on the mock", far from the change that caused it. Only the side-effecting
+// seams below are stubbed; pure helpers such as `widgetDiagnosticUri` stay real.
+vi.mock("../../clients/widget-state.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/widget-state.js")>();
+	return {
+		...actual,
+		getFileDiagnosticSummaries: () => mockSummaries,
+		reconcileStaleWidgetFiles: async () => 0,
+		reconcileStaleWidgetDependencyBlockers: async () => 0,
+		reconcileScanDiagnostics: vi.fn(),
+		reconcileCorrelatedScanDiagnostics: vi.fn(),
+	};
+});
 
 function makeCacheManager(data: Record<string, unknown> = {}) {
 	return {
@@ -293,10 +305,17 @@ describe("lens_diagnostics rule policy — delta mode", () => {
 			}),
 		);
 		const filePath = path.join(tmpDir, "src/foo.ts");
+		// #1634 review round R3: appendProjectDiagnosticsDeltaLines now
+		// freshness-gates against the report's own `generatedAt` — needs a REAL
+		// file (a fixed fake path would be dropped as missing), and a
+		// `generatedAt` after the file's write so the gate reads it live.
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "export const x = 1;\n");
+		const generatedAt = new Date(Date.now() + 60_000).toISOString();
 		projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue({
 			version: 1,
 			cwd: tmpDir,
-			generatedAt: "2026-01-01T00:00:00.000Z",
+			generatedAt,
 			sessionId: "s1",
 			turnIndex: 1,
 			diagnostics: [

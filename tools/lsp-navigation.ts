@@ -15,12 +15,16 @@ import {
 	type LspMutationContext,
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
+import { uriToPath } from "../clients/path-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
 	summarizeWorkspaceEdit,
 } from "../clients/lsp/edits.js";
-import { getLSPService } from "../clients/lsp/index.js";
+import {
+	getLSPService,
+	type LSPWorkspaceScopeAttribution,
+} from "../clients/lsp/index.js";
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
 import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
@@ -918,6 +922,7 @@ export function createLspNavigationTool(
 			let columnResolution: SymbolColumnResolution | undefined;
 			let mutationContext: LspMutationContext | undefined;
 			let requestedApply = false;
+			const workspaceScopeAttribution: LSPWorkspaceScopeAttribution = {};
 
 			const finalize = (
 				payload: {
@@ -957,6 +962,9 @@ export function createLspNavigationTool(
 						supported,
 						diagnosticsMode,
 						columnResolution,
+						...(Object.keys(workspaceScopeAttribution).length > 0
+							? { workspaceScopeAttribution }
+							: {}),
 					},
 				});
 
@@ -1139,9 +1147,12 @@ export function createLspNavigationTool(
 
 			const lspService = getLSPService();
 			if (operation === "capabilities") {
-				const snapshots = await lspService.getCapabilitySnapshots(
-					rawPath ? filePath : undefined,
-				);
+				const snapshots = rawPath
+					? await lspService.getCapabilitySnapshots(filePath)
+					: await lspService.getCapabilitySnapshots(
+							undefined,
+							workspaceScopeAttribution,
+						);
 				const output = formatCapabilities(
 					snapshots,
 					rawPath ? filePath : undefined,
@@ -1165,9 +1176,12 @@ export function createLspNavigationTool(
 			}
 
 			if (operation === "workspaceDiagnostics") {
-				const wsDiagSupport = await lspService.getWorkspaceDiagnosticsSupport(
-					rawPath ? filePath : undefined,
-				);
+				const wsDiagSupport = rawPath
+					? await lspService.getWorkspaceDiagnosticsSupport(filePath)
+					: await lspService.getWorkspaceDiagnosticsSupport(
+							undefined,
+							workspaceScopeAttribution,
+						);
 				diagnosticsMode = wsDiagSupport?.mode ?? "unknown";
 
 				if (rawPath && !filePathIsDirectory) {
@@ -1376,10 +1390,13 @@ export function createLspNavigationTool(
 			const lspEndChar = (endCharacter ?? resolvedCharacter.character) - 1;
 
 			const runWorkspaceSymbolOperation = async (): Promise<SymbolNode[]> => {
-				supported = operationSupportStatus(
-					operation,
-					await lspService.getOperationSupport(rawPath ? filePath : undefined),
-				);
+				const support = rawPath
+					? await lspService.getOperationSupport(filePath)
+					: await lspService.getOperationSupport(
+							undefined,
+							workspaceScopeAttribution,
+						);
+				supported = operationSupportStatus(operation, support);
 				if (supported === false) {
 					throw new Error(
 						"__UNSUPPORTED__ Active LSP server does not advertise support for workspaceSymbol",
@@ -1394,10 +1411,13 @@ export function createLspNavigationTool(
 					await openFileBestEffort(lspService, filePath);
 				}
 				try {
-					const raw = await lspService.workspaceSymbol(
-						query ?? "",
-						rawPath ? filePath : undefined,
-					);
+					const raw = rawPath
+						? await lspService.workspaceSymbol(query ?? "", filePath)
+						: await lspService.workspaceSymbol(
+								query ?? "",
+								undefined,
+								workspaceScopeAttribution,
+							);
 					const filtered = (Array.isArray(raw) ? raw : [raw]).filter(
 						(s) =>
 							typeof s === "object" &&
@@ -1544,9 +1564,12 @@ export function createLspNavigationTool(
 								"__BADINPUT__ command parameter required for executeCommand",
 							);
 						}
-						const advertised = await lspService.getAdvertisedCommands(
-							rawPath ? filePath : undefined,
-						);
+						const advertised = rawPath
+							? await lspService.getAdvertisedCommands(filePath)
+							: await lspService.getAdvertisedCommands(
+									undefined,
+									workspaceScopeAttribution,
+								);
 						const isAdvertised = advertised.includes(command);
 						// Dry-run by default: report advertisement status without running.
 						// Mutation only on explicit apply:true (and the client re-checks
@@ -1568,17 +1591,48 @@ export function createLspNavigationTool(
 								`__UNSUPPORTED__ command "${command}" is not advertised by the active LSP server (advertised: ${advertised.join(", ") || "none"})`,
 							);
 						}
-						return lspService.executeCommand(
-							rawPath ? filePath : undefined,
-							command,
-							commandArguments,
-							mutationContext,
-						);
+						return rawPath
+							? lspService.executeCommand(
+									filePath,
+									command,
+									commandArguments,
+									mutationContext,
+								)
+							: lspService.executeCommand(
+									undefined,
+									command,
+									commandArguments,
+									mutationContext,
+									workspaceScopeAttribution,
+								);
 					}
 					case "incomingCalls": {
 						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for incomingCalls",
+							);
+						}
+						// #1803 fix-round F1: needsFilePath is false for call-hierarchy
+						// traversal (the operand is callHierarchyItem, not path), so the
+						// shared needsFilePath pre-check at line ~1319 never runs for
+						// this operation — LSPService.incomingCalls' own capability gate
+						// (clients/lsp/index.ts) returns a bare [], which this tool layer
+						// cannot distinguish from "supported server, zero callers found".
+						// Pre-check here, keyed off the item's own uri (the file the
+						// resolved server is scoped to), mirrors
+						// runWorkspaceSymbolOperation's supported-check above: throwing
+						// __UNSUPPORTED__ routes through the catch block below into the
+						// same discriminated isError:true/emptyReason:"unsupported" shape
+						// every other capability-gated operation already reports.
+						supported = operationSupportStatus(
+							operation,
+							await lspService.getOperationSupport(
+								uriToPath(callHierarchyItem.uri),
+							),
+						);
+						if (supported === false) {
+							throw new Error(
+								"__UNSUPPORTED__ Active LSP server does not advertise support for incomingCalls",
 							);
 						}
 						return lspService.incomingCalls(callHierarchyItem);
@@ -1587,6 +1641,18 @@ export function createLspNavigationTool(
 						if (!callHierarchyItem) {
 							throw new Error(
 								"__BADINPUT__ callHierarchyItem parameter required for outgoingCalls",
+							);
+						}
+						// #1803 fix-round F1: same pre-check as incomingCalls above.
+						supported = operationSupportStatus(
+							operation,
+							await lspService.getOperationSupport(
+								uriToPath(callHierarchyItem.uri),
+							),
+						);
+						if (supported === false) {
+							throw new Error(
+								"__UNSUPPORTED__ Active LSP server does not advertise support for outgoingCalls",
 							);
 						}
 						return lspService.outgoingCalls(callHierarchyItem);

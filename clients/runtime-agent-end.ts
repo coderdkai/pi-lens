@@ -16,6 +16,7 @@ import {
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
+import { admitBounded, emitBounded } from "./bounded-telemetry.js";
 import { newLspMutationCorrelationId, type LspMutationContext } from "./lsp-mutation.js";
 import {
 	getGlobalActionableWarningMaxFixes,
@@ -208,25 +209,62 @@ export async function handleAgentEnd({
 				.map((r) => `${r.filePath} origin=${r.originCwd}`)
 				.join(", ")}`,
 		);
-		logLatency({
-			type: "phase",
-			toolName: "agent_end",
-			filePath: ctxCwd ?? runtime.projectRoot,
-			phase: "agent_end_deferred_format_orphan_origin_mismatch",
-			durationMs: 0,
-			metadata: {
-				fileCount: droppedOrphans.length,
-				staleAfterMs,
-				currentOriginCwd: ctxCwd ?? runtime.projectRoot,
-				files: droppedOrphans.map((r) => ({
-					filePath: r.filePath,
-					originCwd: r.originCwd,
-					ownerSessionId: r.ownerSessionId,
-					queuedTurnIndex: r.queuedTurnIndex,
-					ageMs: Date.now() - r.lastTouchedAt,
-				})),
-			},
-		});
+		// #1678 item 1: a genuinely abandoned origin re-surfaces the SAME
+		// record on every subsequent agent_end for as long as the queued
+		// entry lives — by design (see the comment above), but the repo
+		// invariant is that a repeated degradation goes through the ledger's
+		// counting path instead of accumulating as unbounded raw log lines.
+		// The ledger is the single source of truth for whether THIS is a
+		// record's first appearance (its return value): the detailed forensic
+		// record below names only the orphans on that rising edge, with file
+		// identity/origin/age. Every later repeat of
+		// the same record is counted ONLY by the ledger's running count —
+		// no second raw event, no parallel "already logged" latch to
+		// maintain here.
+		// #1743: `admitBounded` IS that ledger call, plus the registry
+		// membership the bounded-telemetry sweep checks. This site admits PER
+		// ORPHAN and then writes ONE batched record naming the admitted ones,
+		// which is why it uses `admitBounded` directly instead of a per-record
+		// `emitBounded` — the per-call form would turn one log line into N.
+		const firstSeenOrphans: typeof droppedOrphans = [];
+		for (const record of droppedOrphans) {
+			const isFirstOccurrence = admitBounded(
+				"agent_end_deferred_format_orphan_origin_mismatch",
+				record.filePath,
+				{
+					ledgerKind: "path-attribution-orphan-unresolved",
+					risingEdgePer: "identity",
+					reason: `origin=${record.originCwd} unclaimed >${staleAfterMs}ms`,
+				},
+			);
+			if (isFirstOccurrence) firstSeenOrphans.push(record);
+		}
+		if (firstSeenOrphans.length > 0) {
+			// Already admitted above, one orphan at a time — hence no bounding
+			// options here. The batch's own identity is the origin this flush ran
+			// under; per-file identity rides in `metadata.files`.
+			emitBounded(
+				"agent_end_deferred_format_orphan_origin_mismatch",
+				ctxCwd ?? runtime.projectRoot,
+				{
+					type: "phase",
+					toolName: "agent_end",
+					durationMs: 0,
+					metadata: {
+					fileCount: firstSeenOrphans.length,
+					staleAfterMs,
+					currentOriginCwd: ctxCwd ?? runtime.projectRoot,
+					files: firstSeenOrphans.map((r) => ({
+						filePath: r.filePath,
+						originCwd: r.originCwd,
+						ownerSessionId: r.ownerSessionId,
+						queuedTurnIndex: r.queuedTurnIndex,
+						ageMs: Date.now() - r.lastTouchedAt,
+						})),
+					},
+				},
+			);
+		}
 	}
 	if (records.length === 0 && !inspectActionableReport) return undefined;
 	if (deferredToOwner.length > 0) {

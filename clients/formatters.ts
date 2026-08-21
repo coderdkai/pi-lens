@@ -28,7 +28,7 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
-import { findGlobalBinary } from "./package-manager.js";
+import { findGlobalBinary, findLocalBinUpwards } from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { assertInstallAllowed } from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
@@ -42,12 +42,16 @@ import {
 	hasClangFormatConfig,
 	hasCljfmtConfig,
 	hasCmakeFormatConfig,
+	hasCsharpierConfig,
+	hasFantomasConfig,
 	hasGoogleJavaFormatConfig,
 	hasKtfmtConfig,
 	hasKtlintConfig,
+	hasMixFormatConfig,
 	hasNearestPackageJsonDependency,
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
+	hasOrmoluConfig,
 	hasOxfmtConfig,
 	hasOxfmtSvelteConfig,
 	hasPhpCsFixerConfig,
@@ -58,6 +62,9 @@ import {
 	hasSqlfluffConfig,
 	hasStandardrbConfig,
 	hasStyluaConfig,
+	hasSwiftformatConfig,
+	hasTaploConfig,
+	hasTerraformConfig,
 	hasVitePlusConfig,
 	OXFMT_SUPPORTED_EXTENSIONS,
 } from "./tool-policy.js";
@@ -294,7 +301,15 @@ async function detectCandidate(
 	};
 }
 
-/** Drop the PATH verdicts, so a newly installed binary is visible at once. */
+/**
+ * Drop the PATH verdicts, so a newly installed binary is visible at once.
+ *
+ * Module-private on purpose. Clearing the latches alone does NOT re-arm
+ * formatter availability: `getFormattersForFile` answers from `detectionCache`
+ * before it ever probes PATH, so a caller that wants a genuine re-probe must
+ * drop both. `clearFormatterCache` is that pair, and it is the only reset a
+ * session boundary should call (#1895 review round).
+ */
 function resetWhichLatches(): void {
 	whichLatchByCommand.clear();
 	whichTransientCommands.clear();
@@ -634,6 +649,17 @@ const EXPLICIT_FORMATTER_CONFIG_CHECKS = new Map<
 	["cljfmt", (cwd) => hasCljfmtConfig(cwd)],
 	["cmake-format", (cwd) => hasCmakeFormatConfig(cwd)],
 	["psscriptanalyzer-format", (cwd) => hasPSScriptAnalyzerConfig(cwd)],
+	// #1595 sweep — see the comment above hasCsharpierConfig et al. in
+	// tool-policy.ts for why nixfmt (the 8th formatter #1572 flagged) is NOT
+	// wired here: it has no config-file convention and no manifest-marker
+	// equivalent to `.terraform.lock.hcl`, so there is no honest opt-in signal.
+	["csharpier", (cwd) => hasCsharpierConfig(cwd)],
+	["ormolu", (cwd) => hasOrmoluConfig(cwd)],
+	["taplo", (cwd) => hasTaploConfig(cwd)],
+	["terraform", (cwd) => hasTerraformConfig(cwd)],
+	["swiftformat", (cwd) => hasSwiftformatConfig(cwd)],
+	["fantomas", (cwd) => hasFantomasConfig(cwd)],
+	["mix", (cwd) => hasMixFormatConfig(cwd)],
 ]);
 
 function hasExplicitFormatterConfig(
@@ -1235,8 +1261,17 @@ export const styluaFormatter: FormatterInfo = {
 	name: "stylua",
 	command: ["stylua", "$FILE"],
 	extensions: [".lua"],
+	async resolveCommand(filePath, cwd) {
+		// Project binary first (#1731, discipline B): stylua has no pi-lens
+		// managed install, so before this the ONLY resolution was a bare
+		// `stylua` PATH lookup — a project-local install via npm
+		// `@johnnymorganz/stylua` (`node_modules/.bin/stylua`) was invisible.
+		const local = findLocalBinUpwards("stylua", cwd);
+		return local ? [local, filePath] : null;
+	},
 	async detect(cwd: string) {
-		if ((await which("stylua")) === null) return false;
+		const local = findLocalBinUpwards("stylua", cwd);
+		if (!local && (await which("stylua")) === null) return false;
 		// Prefer explicit config but also run if binary is present in a Lua project
 		const configs = ["stylua.toml", ".stylua.toml"];
 		const found = await findUp(configs, cwd);
@@ -1464,6 +1499,10 @@ const FORMATTER_CONFIG_FILES = [
 	"oxfmt.toml", ".oxfmtrc.json", "vite-plus.json",
 	"vite.config.ts", "vite.config.mts", "vite.config.cts", "vite.config.js", "vite.config.mjs", "vite.config.cjs",
 	"PSScriptAnalyzerSettings.psd1", "ScriptAnalyzerSettings.psd1",
+	// #1595 sweep additions.
+	".csharpierrc", ".csharpierrc.json", ".csharpierrc.yaml", ".csharpierrc.yml",
+	".ormolu", "taplo.toml", ".taplo.toml", ".terraform.lock.hcl", ".swiftformat",
+	".fantomasignore", ".formatter.exs",
 ];
 
 async function formatterConfigSignature(cwd: string): Promise<string> {
@@ -1696,6 +1735,16 @@ export async function getFormattersForFile(
 	return enabled;
 }
 
+/**
+ * Re-arm formatter availability: drop both the per-cwd selection cache and the
+ * PATH latches.
+ *
+ * #1895: this is the session-boundary reset. Both halves are required. The
+ * latches decide whether `which` runs at all, but `detectionCache` short-
+ * circuits ahead of them — a same-cwd lookup returns the previous verdict's
+ * formatter names without reaching a probe. Clearing only the latches
+ * therefore re-arms every directory EXCEPT the one the user is working in.
+ */
 export function clearFormatterCache(): void {
 	detectionCache.clear();
 	resetWhichLatches();

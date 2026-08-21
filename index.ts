@@ -25,6 +25,7 @@ import {
 } from "./clients/extension-mode.js";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
+import { performance } from "node:perf_hooks";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createDefaultHostPorts, type HostPorts } from "./clients/host-ports.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
@@ -80,6 +81,10 @@ import { wireDispositionBusEmitterGetter } from "./clients/disposition-publish.j
 import { wireFormatEventsBusEmitterGetter } from "./clients/format-events-publish.js";
 import { emitBusEventRollupAtSessionEnd } from "./clients/bus-events-logger.js";
 import {
+	emitVerifiedPathAttributionRollup,
+	resetVerifiedPathAttributionGuessCount,
+} from "./clients/path-attribution-telemetry.js";
+import {
 	consumeAgentNudge,
 	recordCrossProcessTouches,
 	wireAgentNudgeSubscriber,
@@ -95,7 +100,7 @@ import { getLSPService, resetLSPService } from "./clients/lsp/index.js";
 import { warmLspService } from "./clients/lsp-lazy.js";
 import {
 	sweepOrphans,
-	sweepUntrackedOrphans,
+	scheduleUntrackedOrphanSweep,
 } from "./clients/instance-reaper.js";
 import {
 	deregisterInstance,
@@ -171,7 +176,22 @@ import {
 } from "./tools/module-report.js";
 import { createProjectReportTool } from "./tools/project-report.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
-import { getLastLoggedPhase, logLatency } from "./clients/latency-logger.js";
+import {
+	getLastLoggedPhase,
+	getPhaseForWindow,
+	getRecentLoggedPhases,
+	logLatency,
+	resetCurrentPhaseForSession,
+} from "./clients/latency-logger.js";
+import { emitBounded } from "./clients/bounded-telemetry.js";
+
+/**
+ * Identity for the `loop_block` record (#1743). An event-loop block is a
+ * process-wide fact — there is no file, tool, or request to discriminate on —
+ * so the identity is this fixed marker, the same value the record's
+ * `filePath` has carried since #192.
+ */
+const LOOP_BLOCK_IDENTITY = "<pi-lens>";
 import {
 	isFreshSessionStart,
 	planToolSet,
@@ -187,6 +207,8 @@ import {
 import {
 	getPiLensEvalMs,
 	markPiLensLoaded,
+	getPiLensLoadedAtMs,
+	consumeHostReadyDelayAnchor,
 	PI_LENS_HOST_BOOT_MS,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
@@ -199,6 +221,7 @@ import { renderTurnSummaryMessage } from "./clients/turn-summary-render.js";
 import {
 	getEventLoopStats,
 	resetEventLoopMonitor,
+	shouldLogLoopBlock,
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "./clients/event-loop-monitor.js";
@@ -226,6 +249,7 @@ function resetDispatchBaselines(cwd?: string): void {
 // First executable statement: every import above has been evaluated, so the
 // full load/transpile cost has been paid. Capture it now.
 const PI_LENS_LOAD_MS = markPiLensLoaded();
+const PI_LENS_LOADED_AT_MS = getPiLensLoadedAtMs();
 const PI_LENS_EVAL_MS = getPiLensEvalMs() ?? 0;
 // Start the event-loop occupancy monitor as early as possible so startup
 // blocks are captured. Native histogram — no per-event overhead. (#192)
@@ -1623,6 +1647,8 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// --- Events ---
 
 	pi.on("session_start", async (event, ctx) => {
+		const sessionStartMonotonicAt = performance.now();
+		resetVerifiedPathAttributionGuessCount();
 		warmDispatchAtSessionStart();
 		void warmLspService().catch((err) =>
 			logExtension({ subsystem: "lsp", level: "warn", message: `LSP warm failed: ${err}` }),
@@ -1687,6 +1713,19 @@ function activateExtension(hostPi: ExtensionAPI) {
 				});
 				return;
 			}
+
+			// #1723 review F4: the in-flight-phase live-bracket map/closed-ring
+			// (clients/latency-logger.ts) is process-shared state, exactly like
+			// the LSP fleet / runtime generation the #473 gate above already
+			// protects — so this reset belongs BEHIND that gate, not before it.
+			// A concurrent secondary's session_start must not wipe brackets a
+			// still-live PARENT activation genuinely has open; only a confirmed
+			// full session start (this line has already returned otherwise) may
+			// assume no sibling activation still owns live brackets in this
+			// process. See `resetCurrentPhaseForSession`'s doc comment for the
+			// accepted cost on the other side (a torn-down secondary's own
+			// bracket goes stale until the next full session start).
+			resetCurrentPhaseForSession();
 
 			// Dynamic tooling (#pi 0.80.x+): put the active tool set back to the
 			// posture this logical conversation had — the always-active baseline
@@ -1795,7 +1834,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// untracked by the current registry snapshot AND have a
 			// confirmed-dead parent — never on name alone. Fire-and-forget, same
 			// non-blocking/never-throws contract as `sweepOrphans`.
-			void sweepUntrackedOrphans();
+			//
+			// #1857: SCHEDULED, not called. The sweep's OS-process enumeration was
+			// measured at 9344ms on the session_start critical path, exactly
+			// overlapping and starving `warmup_language_profile`. It now fires on
+			// an unref'd timer well after warmup, under a machine-wide cooldown.
+			scheduleUntrackedOrphanSweep();
 			// #449 slice 2 (prototype): machine-wide LSP budget check. Reads the
 			// same registry, decides locally whether THIS session should skip
 			// spawning auxiliary LSP servers, and caches the decision for
@@ -1857,9 +1901,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 			} = await loadBootstrapClients();
 			const bootstrapClientsDurationMs = Date.now() - bootstrapClientsStartedAt;
 			const handlerEnteredAt = Date.now();
+			// Consume the process-lifetime measurement at the first real session
+			// start. Concurrent secondary starts never reach this handler.
+			const emitHostReadyDelay = consumeHostReadyDelayAnchor();
 			await handleSessionStart({
 				ctxCwd: ctx.cwd,
 				sessionStartFiredAt,
+				sessionStartMonotonicAt,
+				extensionLoadedAt: PI_LENS_LOADED_AT_MS,
+				emitHostReadyDelay,
 				sessionReason,
 				handlerEnteredAt,
 				bootstrapClientsStartedAt,
@@ -2281,40 +2331,99 @@ function activateExtension(hostPi: ExtensionAPI) {
 		setAmbientAbortSignal((ctx as { signal?: AbortSignal })?.signal);
 		try {
 			const repaintLspStatus = captureLspStatusRepaint(ctx);
-			// Persist a new worst event-loop block to latency.log, attributed to
-			// this turn, so freezes are queryable across sessions (#192). The
-			// window is per-turn (#1122): the probe cannot itself see machine
-			// sleep or commit-charge paging, both of which freeze the process and
-			// masquerade as huge synchronous blocks, so we tag samples the turn's
-			// CPU budget can't account for as `suspectSystemStall` and keep them
-			// out of the genuine-block high-waters. `lastPhase` is cheap block
-			// attribution (#1123 item 1) — the last phase that ran before the
-			// block was detected.
+			// Persist every event-loop block over the floor to latency.log,
+			// attributed to this turn, so freezes are queryable across sessions
+			// (#192). Logging used to gate on "new session worst" alone, which
+			// hid every sub-maximum block after a session's first large one —
+			// exactly the blocks that need to be checked against LSP pull
+			// timeouts (#1549/#1713), so #1723 widened the gate to the floor and
+			// kept "new worst" only as metadata / high-water bookkeeping. Volume
+			// stays bounded because this runs at most once per turn (the window
+			// is per-turn, #1122): one `loop_block` record per turn, not one per
+			// sample. The window is per-turn also so the probe cannot itself see
+			// machine sleep or commit-charge paging, both of which freeze the
+			// process and masquerade as huge synchronous blocks — samples the
+			// turn's CPU budget can't account for are tagged
+			// `suspectSystemStall` and excluded from the genuine-block
+			// high-waters. `lastPhase`/`recentPhases` are cheap block attribution
+			// (#1123 item 1, widened #1723 item 2) — the phases that ran before
+			// the block was detected; a bounded ring rather than one pointer,
+			// because the phase actually causing a synchronous block is often
+			// still in flight (and so unlogged) when the block fires, so the
+			// single last-COMPLETED phase can point at unrelated prior work.
 			const elStats = getEventLoopStats();
 			const loopMaxMs = elStats?.maxMs ?? 0;
 			const suspectSystemStall = elStats?.suspectSystemStall ?? false;
-			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+			if (shouldLogLoopBlock(loopMaxMs)) {
 				const lastPhase = getLastLoggedPhase();
-				logLatency({
+				const recentPhases = getRecentLoggedPhases(3);
+				// #1723 residual, redesigned after review (F1/F2/F3): `lastPhase`/
+				// `recentPhases` above only ever name a phase that already
+				// FINISHED. The motivating case — an 18s synchronous full-scan
+				// block — had no attribution because the phase burning the CPU was
+				// still running when the probe sampled, so it hadn't logged a
+				// completion yet. `getPhaseForWindow` (clients/latency-logger.ts)
+				// checks the block's own time window against both the still-live
+				// brackets dispatcher.ts's `runRunner` keeps open AND a short ring
+				// of recently CLOSED ones — the latter is load-bearing, not
+				// redundant: `phaseFinished` resumes as a microtask, `turn_end` is
+				// scheduled as a macrotask, and microtasks always drain first, so a
+				// genuinely synchronous phase has typically ALREADY closed by the
+				// time this line runs. Checking live brackets alone would read
+				// empty for exactly the case this exists to catch. NOT wired into
+				// the LSP workspace-diagnostics sweep's own touch loop
+				// (clients/lsp/index.ts) — that remains a named, deferred gap (see
+				// the PR body / issue comment), not a silent one.
+				//
+				// #1723 review round 3: this window — [now - loopMaxMs, now] —
+				// assumes the block ENDED right at this sample, which is a
+				// reasonable approximation, not a measured fact (getEventLoopStats
+				// reports the window's max delay, not its precise end instant). A
+				// human reader has `inFlightPhaseStartedAt`/`inFlightPhaseElapsedMs`/
+				// `inFlightPhaseStillRunning` on the record below to judge that
+				// assumption per-block; an automated correlation (#1549) should
+				// account for the same slack rather than treating these window
+				// edges as exact.
+				const blockSampledAtMs = Date.now();
+				const inFlight = getPhaseForWindow(
+					blockSampledAtMs - loopMaxMs,
+					blockSampledAtMs,
+				);
+				const isNewSessionWorst = shouldLogWorstBlock(
+					loopMaxMs,
+					lastLoggedLoopWorstMs,
+				);
+				// #1743: routed through the bounded-telemetry helper. No
+				// `capPerTurn` here, deliberately: this site's bound is its CALL
+				// CADENCE (#1723) — `turn_end` runs it at most once per turn
+				// because the histogram window resets every turn — so a
+				// `capPerTurn: 1` would be a second, redundant guard that could
+				// only ever fire in a harness that drives two `turn_end`s without
+				// an intervening `turn_start`. The helper still supplies the
+				// registry membership the sweep checks.
+				emitBounded("loop_block", LOOP_BLOCK_IDENTITY, {
 					type: "phase",
-					filePath: "<pi-lens>",
-					phase: "loop_block",
 					durationMs: Math.round(loopMaxMs),
 					metadata: {
-						worstSoFar: true,
+						worstSoFar: isNewSessionWorst,
 						turnIndex: runtime.turnIndex,
 						suspectSystemStall,
 						windowCpuMs: elStats?.windowCpuMs,
 						windowWallMs: elStats?.windowWallMs,
 						lastPhase: lastPhase?.phase,
 						lastPhaseAt: lastPhase?.ts,
+						recentPhases,
+						inFlightPhase: inFlight?.phase,
+						inFlightPhaseStartedAt: inFlight?.startedAt,
+						inFlightPhaseElapsedMs: inFlight?.elapsedMs,
+						inFlightPhaseStillRunning: inFlight?.stillRunning,
 					},
 				});
 				// A system stall must not raise the "new worst genuine block"
 				// bar, or it would silence every real block that follows it.
 				if (suspectSystemStall) {
 					sessionSuspectedStalls += 1;
-				} else {
+				} else if (isNewSessionWorst) {
 					lastLoggedLoopWorstMs = loopMaxMs;
 					sessionWorstRealBlockMs = Math.max(
 						sessionWorstRealBlockMs,
@@ -2690,6 +2799,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// returned before reaching here), since the rollup counters are
 		// process-wide module state a live secondary would still need.
 		emitBusEventRollupAtSessionEnd(runtime.projectRoot);
+		emitVerifiedPathAttributionRollup(runtime.projectRoot);
 		// #1123 item 4: dump active handles AFTER teardown — whatever is still
 		// alive at this point is exactly what would keep a --print/--no-session
 		// process from exiting (the #1097 lesson: what survives IS the leak).

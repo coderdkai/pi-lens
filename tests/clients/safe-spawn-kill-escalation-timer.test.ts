@@ -27,31 +27,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-type Listener = (...args: unknown[]) => void;
-
-function makeFakeChild(pid = 4242) {
-	const listeners: Record<string, Listener[]> = {};
-	const child = {
-		pid,
-		killed: false,
-		kill: vi.fn(() => {
-			child.killed = true;
-			return true;
-		}),
-		on: vi.fn((event: string, listener: Listener) => {
-			(listeners[event] ??= []).push(listener);
-			return child;
-		}),
-		removeListener: vi.fn(),
-		stdout: { setEncoding: vi.fn(), on: vi.fn() },
-		stderr: { setEncoding: vi.fn(), on: vi.fn() },
-		emit(event: string, ...args: unknown[]) {
-			for (const l of listeners[event] ?? []) l(...args);
-		},
-	};
-	return child;
-}
+import { makeFakeChild } from "../support/fake-child.js";
 
 const spawnMock = vi.fn();
 vi.mock("node:child_process", async (importOriginal) => {
@@ -87,7 +63,7 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 	});
 
 	it("clears the 1s escalation timer once the child exits, instead of leaving it pending", async () => {
-		const child = makeFakeChild();
+		const child = makeFakeChild(4242);
 		spawnMock.mockReturnValue(child);
 
 		const escalationHandles: unknown[] = [];
@@ -95,7 +71,7 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 		const realSetTimeout = global.setTimeout;
 		const realClearTimeout = global.clearTimeout;
 		vi.spyOn(global, "setTimeout").mockImplementation(
-			((fn: Listener, ms?: number, ...args: unknown[]) => {
+			((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
 				const handle = realSetTimeout(fn as never, ms, ...args);
 				if (ms === 1000) escalationHandles.push(handle);
 				return handle;
@@ -130,7 +106,13 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 		// The child actually exits from SIGTERM alone — SIGKILL is never
 		// needed, so the escalation timer's callback never fires.
 		child.killed = true;
+		// #1656: safeSpawnAsync now finalizes off "exit" (then waits for the
+		// pipes to fall idle), not "close" — a real Node child always emits
+		// both (exit first), so the fixture must too. Advance past the
+		// post-exit idle-grace window (100ms) so the pipe-idle wait settles.
+		child.emit("exit", null, "SIGTERM");
 		child.emit("close", null, "SIGTERM");
+		await vi.advanceTimersByTimeAsync(150);
 		const result = await resultPromise;
 
 		expect(result.failure).toBe("aborted");
@@ -143,7 +125,7 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 	});
 
 	it("clears the escalation timer on the child's error path too", async () => {
-		const child = makeFakeChild();
+		const child = makeFakeChild(4242);
 		spawnMock.mockReturnValue(child);
 
 		const escalationHandles: unknown[] = [];
@@ -151,7 +133,7 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 		const realSetTimeout = global.setTimeout;
 		const realClearTimeout = global.clearTimeout;
 		vi.spyOn(global, "setTimeout").mockImplementation(
-			((fn: Listener, ms?: number, ...args: unknown[]) => {
+			((fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
 				const handle = realSetTimeout(fn as never, ms, ...args);
 				if (ms === 1000) escalationHandles.push(handle);
 				return handle;
@@ -197,7 +179,7 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 	// because SIGKILL is never sent; post-fix (`!closed` gating, closed only
 	// flips true from an observed close/error) it fires as designed.
 	it("escalates SIGTERM to SIGKILL at the 1s mark when the child ignores SIGTERM (#1114)", async () => {
-		const child = makeFakeChild();
+		const child = makeFakeChild(4242);
 		spawnMock.mockReturnValue(child);
 
 		const controller = new AbortController();
@@ -220,7 +202,13 @@ describe("safeSpawnAsync — non-Windows kill escalation timer cleanup (#1109)",
 		// Let the child actually die now so the pending promise settles and
 		// the test can complete cleanly.
 		child.killed = true;
+		// #1656: safeSpawnAsync now finalizes off "exit" (then waits for the
+		// pipes to fall idle), not "close" — a real Node child always emits
+		// both (exit first), so the fixture must too. Advance past the
+		// post-exit idle-grace window (100ms) so the pipe-idle wait settles.
+		child.emit("exit", null, "SIGKILL");
 		child.emit("close", null, "SIGKILL");
+		await vi.advanceTimersByTimeAsync(150);
 		const result = await resultPromise;
 		expect(result.failure).toBe("aborted");
 	});

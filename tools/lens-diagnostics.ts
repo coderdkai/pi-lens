@@ -21,6 +21,7 @@ import {
 	type DispositionCandidate,
 } from "../clients/diagnostic-dispositions.js";
 import { applyInlineSuppressions } from "../clients/dispatch/inline-suppressions.js";
+import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
 import { normalizeRuleId } from "../clients/dispatch/rule-id-normalize.js";
 import { applyRulePolicy, rulePolicyMapFromConfig } from "../clients/dispatch/rule-policy.js";
 import { loadPiLensProjectConfig } from "../clients/project-lens-config.js";
@@ -49,7 +50,7 @@ import {
 	reconcileProjectDiagnosticsSnapshot,
 } from "../clients/project-diagnostics/cache.js";
 import {
-	formatCacheAge,
+	formatCacheAgeOld,
 	formatNotRunEntry,
 } from "../clients/project-diagnostics/extractors.js";
 import type { FreshProjectDiagnosticsResult } from "../clients/project-diagnostics/fresh-fetch.js";
@@ -73,14 +74,24 @@ import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings
 import {
 	getFileDiagnosticSummaries,
 	type FileDiagnosticSummary,
+	reconcileCorrelatedScanDiagnostics,
 	reconcileScanDiagnostics,
+	reconcileStaleWidgetDependencyBlockers,
 	reconcileStaleWidgetFiles,
 	type WidgetDiagnostic,
+	widgetDiagnosticUri,
 } from "../clients/widget-state.js";
+import { logLatency } from "../clients/latency-logger.js";
 import { convertLspDiagnostics } from "../clients/dispatch/utils/lsp-diagnostics.js";
 import { retagAuxiliaryDiagnostics } from "../clients/dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../clients/file-role.js";
+import { STALE_LINE_MARKER } from "../clients/stale-marker.js";
 import { makeProgressReporter, scanningSummaryLine } from "./scan-progress.js";
+import {
+	demotePastEofDiagnostics,
+	PAST_EOF_STALE_MARKER,
+	resyncDocumentOnPastEof,
+} from "../clients/diagnostic-line-freshness.js";
 
 // The widget state exposes the full per-file diagnostic set; this is the tool's
 // own generous display budget per file (independent of the TUI's 12 cap), to
@@ -129,6 +140,9 @@ type WorkspaceLspDiagnosticResult = {
 	timedOut?: boolean;
 	// #1618: WHY `timedOut` is true — see LSPWorkspaceUnconfirmedReason.
 	unconfirmedReason?: LSPWorkspaceUnconfirmedReason;
+	// Auxiliary lanes that did not answer. Other servers' diagnostics remain
+	// usable, but this result must not replace fully-covered cached/widget state.
+	unconfirmedServerIds?: string[];
 	// #1093: set only for cache-hit results (a replay of an older scan) — the
 	// wall-clock time the diagnostics were originally observed. Threaded into the
 	// footer reconcile so a cache-served mode=full doesn't re-arm the widget's
@@ -299,6 +313,17 @@ export function createLensDiagnosticsTool(
 					return `lens_diagnostics delta — clean${coldSuffix}${failedSuffix}`;
 				return `lens_diagnostics delta — ${aw} actionable · ${cq} quality · ${pd} project${coldSuffix}${failedSuffix}`;
 			}
+			// #1799: `semantic === "blocking"` iff `severity === "error"` holds for
+			// RAW classification, but not for the rendered counts — a
+			// dependency-drift demotion (#1631, widget-state.ts `isBlocking` vs
+			// `countDiagnostics`) revokes an error's blocking authority (stale)
+			// while the finding itself stays real evidence, so it lands in
+			// `totalErrors` with `totalBlocking` unchanged. That is the one case
+			// where the two totals genuinely disagree, and it must still render —
+			// otherwise a file with drift-demoted errors reads as "clean". What
+			// must NOT happen is printing both terms for the SAME findings (the
+			// actual #1799 bug), so `errors` renders only when `blocking === 0`,
+			// mirroring the per-file row's own guard below.
 			const b = details?.totalBlocking ?? 0;
 			const e = details?.totalErrors ?? 0;
 			const w = details?.totalWarnings ?? 0;
@@ -306,7 +331,10 @@ export function createLensDiagnosticsTool(
 			if (b + e + w === 0) {
 				return `lens_diagnostics ${mode} — clean (${files} files)${coldSuffix}${failedSuffix}`;
 			}
-			return `lens_diagnostics ${mode} — ${b} blocking · ${e} errors · ${w} warnings (${files} files)${coldSuffix}${failedSuffix}`;
+			const parts = [`${b} blocking`];
+			if (b === 0 && e > 0) parts.push(`${e} errors`);
+			parts.push(`${w} warnings`);
+			return `lens_diagnostics ${mode} — ${parts.join(" · ")} (${files} files)${coldSuffix}${failedSuffix}`;
 		}),
 		parameters: Type.Object({
 			mode: Type.Optional(
@@ -429,6 +457,28 @@ export function createLensDiagnosticsTool(
 			const staleDropped = await reconcileStaleWidgetFiles();
 
 			if (mode === "all") {
+				// #1631 dependency-axis gate for the mode=all store. `reconcileStaleWidgetFiles`
+				// (above) only sees the diagnosed file's OWN mtime; this demotes blocking
+				// findings whose forward imports drifted out-of-band. Paired reconciles, one
+				// read site — the same gate that covers the turn-end inline-blocker store.
+				const dependencyGateStart = Date.now();
+				const { demoted: dependencyDemoted, truncatedImports } =
+					await reconcileStaleWidgetDependencyBlockers(
+						cwd,
+						getRuntime?.()?.turnIndex,
+					);
+				logLatency({
+					type: "phase",
+					toolName: "lens_diagnostics",
+					filePath: cwd,
+					phase: "blocker_freshness_widget_gate",
+					durationMs: Date.now() - dependencyGateStart,
+					metadata: {
+						demoted: dependencyDemoted,
+						truncatedImports,
+						surface: "mode=all",
+					},
+				});
 				return formatAllMode(
 					cwd,
 					severity,
@@ -436,6 +486,7 @@ export function createLensDiagnosticsTool(
 					undefined,
 					staleDropped,
 					pathsScope,
+					dependencyDemoted,
 				);
 			}
 			if (mode === "full") {
@@ -468,15 +519,30 @@ export function createLensDiagnosticsTool(
 
 // ── delta mode ────────────────────────────────────────────────────────────────
 
-function formatProjectDeltaDiagnostic(diagnostic: ProjectDiagnostic): string {
+function formatProjectDeltaDiagnostic(
+	diagnostic: ProjectDiagnostic,
+	stale: boolean,
+): string {
 	const marker =
 		diagnostic.semantic === "blocking" || diagnostic.severity === "error"
 			? "🔴"
 			: "ℹ";
 	const rule = diagnostic.rule ?? diagnostic.code ?? diagnostic.runner;
-	return `  ${marker} L${diagnostic.line ?? "?"}  ${rule}  ${diagnostic.message}`;
+	const where = stale ? STALE_LINE_MARKER : `L${diagnostic.line ?? "?"}`;
+	return `  ${marker} ${where}  ${rule}  ${diagnostic.message}`;
 }
 
+/**
+ * #1634 review round R3: `appendProjectDiagnosticsDeltaLines` re-serves the
+ * persisted project-diagnostics DELTA report verbatim — the third of
+ * `mode=delta`'s three arms (the other two, actionable/quality warnings, were
+ * gated in the F3 pass above), and it carried the identical unfixed shape:
+ * cited `file:line` findings from a report with its own `generatedAt`, no
+ * freshness check. Same gate, same policy as `applyDeltaFreshnessGate`:
+ * missing file -> DROP, edited-since -> DEMOTE (loses its line, keeps
+ * rule/message), live -> unchanged. See `clients/finding-delivery-gate.ts`
+ * surface `lens-diagnostics:mode-delta`.
+ */
 function appendProjectDiagnosticsDeltaLines(
 	lines: string[],
 	cwd: string,
@@ -484,11 +550,27 @@ function appendProjectDiagnosticsDeltaLines(
 	severity: string,
 	includeFile: (filePath: string) => boolean,
 ): number {
-	const diagnostics = (report?.diagnostics ?? []).filter(
+	const scoped = (report?.diagnostics ?? []).filter(
 		(diagnostic) =>
 			includeFile(diagnostic.filePath) &&
-			matchesSeverity(projectDiagnosticToWidget(diagnostic), severity),
+			matchesSeverity(
+				projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
+				severity,
+			),
 	);
+	const gated = gateFindingsByPathFreshness({
+		store: "lens-diagnostics-delta-project",
+		findings: scoped,
+		cwd,
+		scannedAt: report?.generatedAt,
+		citedPath: (d) => d.filePath,
+		onMissing: "drop",
+	});
+	const staleSet = new Set(gated.stale);
+	// Concatenating live-then-stale reorders a file's demoted rows to the end
+	// of its bucket below (rather than each diagnostic's original report
+	// order) — cosmetic only, findings are neither dropped nor duplicated.
+	const diagnostics = [...gated.live, ...gated.stale];
 	const byFile = new Map<string, ProjectDiagnostic[]>();
 	for (const diagnostic of diagnostics) {
 		const filePath = path.resolve(diagnostic.filePath);
@@ -500,7 +582,7 @@ function appendProjectDiagnosticsDeltaLines(
 		const rel = path.relative(cwd, filePath);
 		if (!lines.includes(rel)) lines.push(rel);
 		for (const diagnostic of fileDiagnostics) {
-			lines.push(formatProjectDeltaDiagnostic(diagnostic));
+			lines.push(formatProjectDeltaDiagnostic(diagnostic, staleSet.has(diagnostic)));
 		}
 	}
 	return diagnostics.length;
@@ -525,7 +607,11 @@ function filterDeltaReportDispositions(
 	if (!report?.diagnostics.length) return report;
 	const kept = report.diagnostics.filter(
 		(d) =>
-			applyWeakDispositions([projectDiagnosticToWidget(d)], cwd, d.filePath)
+			applyWeakDispositions(
+				[projectDiagnosticToWidget(d, d.filePath)],
+				cwd,
+				d.filePath,
+			)
 				.length === 1,
 	);
 	const policyKept = applyRulePolicy(kept, policyMap);
@@ -545,6 +631,60 @@ function loadProjectRulePolicyMap(cwd: string) {
 	return rulePolicyMapFromConfig(loadPiLensProjectConfig(cwd).rules);
 }
 
+/**
+ * #1634 review round: `formatDeltaMode` re-serves the `actionable-warnings`/
+ * `code-quality-warnings` caches verbatim — each cited `file:line`, no
+ * freshness check — the SAME shape #1622 fixed for gitleaks/trivy-secrets,
+ * unfixed here because `mode=delta` is the tool's DEFAULT and easy to miss
+ * in a per-store sweep. Both reports carry a report-level `generatedAt`; a
+ * warning is gated against it exactly like a scanner finding against
+ * `scannedAt`: missing file → DROP (nothing to fix in a file that's gone),
+ * edited-since → DEMOTE (loses its line, keeps its rule/message, marked
+ * `STALE_LINE_MARKER`), live → unchanged. See
+ * `clients/finding-delivery-gate.ts` surface `lens-diagnostics:mode-delta`.
+ */
+function applyDeltaFreshnessGate<W extends DispositionCandidate>(
+	files: Array<{ filePath: string; warnings: W[] }>,
+	cwd: string,
+	generatedAt: string | undefined,
+): Array<{ filePath: string; warnings: Array<W & { stale?: boolean }> }> {
+	if (!generatedAt) return files;
+	const flat: Array<{ filePath: string; warning: W }> = [];
+	for (const file of files) {
+		for (const warning of file.warnings) flat.push({ filePath: file.filePath, warning });
+	}
+	if (flat.length === 0) return files;
+	const gated = gateFindingsByPathFreshness({
+		store: "lens-diagnostics-delta",
+		findings: flat,
+		cwd,
+		scannedAt: generatedAt,
+		citedPath: (f) => f.filePath,
+		onMissing: "drop",
+	});
+	// Two passes (live, then stale) reorder a file's demoted rows to the end
+	// of its warnings array rather than the original report order — cosmetic
+	// only, nothing is dropped or duplicated.
+	const byFile = new Map<string, Array<W & { stale?: boolean }>>();
+	for (const f of gated.live) {
+		const arr = byFile.get(f.filePath) ?? [];
+		arr.push(f.warning);
+		byFile.set(f.filePath, arr);
+	}
+	for (const f of gated.stale) {
+		const arr = byFile.get(f.filePath) ?? [];
+		arr.push({ ...f.warning, stale: true, line: undefined });
+		byFile.set(f.filePath, arr);
+	}
+	return files
+		.map((file) => ({
+			filePath: file.filePath,
+			warnings: byFile.get(file.filePath) ?? [],
+		}))
+		.filter((file) => file.warnings.length > 0);
+}
+
+// @delivery-surface: lens-diagnostics:mode-delta
 function formatDeltaMode(
 	cacheManager: CacheManager,
 	cwd: string,
@@ -594,8 +734,16 @@ function formatDeltaMode(
 				),
 			}))
 			.filter((file) => file.warnings.length > 0);
-	const actionableFiles = visibleWarningFiles(actionable?.files);
-	const qualityFiles = visibleWarningFiles(quality?.files);
+	const actionableFiles = applyDeltaFreshnessGate(
+		visibleWarningFiles(actionable?.files),
+		cwd,
+		actionable?.generatedAt,
+	);
+	const qualityFiles = applyDeltaFreshnessGate(
+		visibleWarningFiles(quality?.files),
+		cwd,
+		quality?.generatedAt,
+	);
 
 	const lines: string[] = [];
 
@@ -605,9 +753,8 @@ function formatDeltaMode(
 			const rel = path.relative(cwd, file.filePath);
 			lines.push(`${rel}`);
 			for (const w of file.warnings) {
-				lines.push(
-					`  ⚠ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
-				);
+				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
+				lines.push(`  ⚠ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
 			}
 		}
 	}
@@ -618,9 +765,8 @@ function formatDeltaMode(
 			const rel = path.relative(cwd, file.filePath);
 			if (!lines.includes(rel)) lines.push(rel);
 			for (const w of file.warnings) {
-				lines.push(
-					`  ℹ L${w.line ?? "?"}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`,
-				);
+				const where = w.stale ? STALE_LINE_MARKER : `L${w.line ?? "?"}`;
+				lines.push(`  ℹ ${where}  ${w.rule ?? w.code ?? w.tool}  ${w.message}`);
 			}
 		}
 	}
@@ -861,8 +1007,11 @@ function applyProjectRulePolicy<T extends { diagnostics: ProjectDiagnostic[] }>(
 	return { ...value, diagnostics: applyRulePolicy(value.diagnostics, policyMap) };
 }
 
-/** A diagnostic counts as error-like when it blocks or has error severity. */
+/** A diagnostic counts as error-like when it blocks or has error severity.
+ * A `stale` (#1641 past-EOF) entry is excluded — its cited line no longer
+ * exists in the current file, so it can no longer count toward a hard stop. */
 function isErrorLike(d: WidgetDiagnostic): boolean {
+	if (d.stale) return false;
 	return d.semantic === "blocking" || d.severity === "error";
 }
 
@@ -914,6 +1063,7 @@ function lspDiagnosticToWidget(diagnostic: LSPDiagnostic): WidgetDiagnostic {
 
 function projectDiagnosticToWidget(
 	diagnostic: ProjectDiagnostic,
+	filePath: string,
 ): WidgetDiagnostic {
 	return {
 		severity: diagnostic.severity,
@@ -923,6 +1073,7 @@ function projectDiagnosticToWidget(
 		col: diagnostic.column,
 		rule: diagnostic.rule ?? diagnostic.code,
 		tool: diagnostic.runner || diagnostic.tool,
+		uri: widgetDiagnosticUri(filePath, diagnostic.line, diagnostic.column),
 	};
 }
 
@@ -954,9 +1105,23 @@ function summarizeDiagnostics(
 	let errors = 0;
 	let warnings = 0;
 	for (const diagnostic of diagnostics) {
+		// #1641: a demoted past-EOF entry keeps its severity for display but
+		// drops out of the tallies — same reasoning as widget-state's `isBlocking`.
+		if (diagnostic.stale) continue;
 		if (diagnostic.semantic === "blocking") blocking++;
 		if (diagnostic.severity === "error") errors++;
-		else if (diagnostic.severity === "warning") warnings++;
+		// #1777: `hint` and `info` tally alongside `warning`, matching
+		// `countDiagnostics` in `clients/widget-state.ts` — mode=all reads that
+		// tally and mode=full reads this one, so the two must agree. An exact
+		// `=== "warning"` test scored a hint-only file 0/0/0, the `withIssues`
+		// filter below then dropped it, and mode=full rendered "No issues" for a
+		// file whose own `details` still carried the diagnostic.
+		else if (
+			diagnostic.severity === "warning" ||
+			diagnostic.severity === "hint" ||
+			diagnostic.severity === "info"
+		)
+			warnings++;
 	}
 	return {
 		filePath,
@@ -1188,13 +1353,13 @@ function mergeDiagnosticsWithWidgetSummaries(
 	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic),
+			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
 	for (const diagnostic of projectDelta?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic),
+			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
 
@@ -1350,6 +1515,7 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 	return undefined;
 }
 
+// @delivery-surface: lens-diagnostics:mode-full
 async function formatFullMode(
 	cwd: string,
 	severity: string,
@@ -1490,6 +1656,12 @@ async function formatFullMode(
 			!result.error &&
 			!mismatchedLspResults.has(result),
 	);
+	const fullyCoveredLspResults = confirmedLspResults.filter(
+		(result) => (result.unconfirmedServerIds?.length ?? 0) === 0,
+	);
+	const partiallyCoveredLspResults = confirmedLspResults.filter(
+		(result) => (result.unconfirmedServerIds?.length ?? 0) > 0,
+	);
 	const unconfirmedLspResults = lspResults.filter(
 		(result) =>
 			result.timedOut ||
@@ -1499,7 +1671,7 @@ async function formatFullMode(
 	// #571: reconcile this scan's fresh, CONFIRMED per-file results into the
 	// footer cache. A footer write is never allowed to fail the tool call, so
 	// any unexpected throw is swallowed.
-	for (const result of confirmedLspResults) {
+	for (const result of fullyCoveredLspResults) {
 		try {
 			// #692: provenance label ONLY — must never affect `rule`/identity (see
 			// `ConvertLspDiagnosticsOptions.scanOrigin`'s doc comment).
@@ -1605,6 +1777,28 @@ async function formatFullMode(
 		cwd,
 		policyMap,
 	);
+	// #1888: the full-mode summary above is the first seam where every
+	// producing lane is correlated. The earlier footer loop intentionally writes
+	// only CONFIRMED LSP results, so an ast-grep backpressure failure left
+	// project-scan (`ast-grep-napi`) findings visible to lens_diagnostics but
+	// absent from the widget. Commit this same post-policy, post-suppression set
+	// to the widget so its human-facing count cannot silently become single-lane.
+	const parsedProjectScanObservedAt = projectSnapshot?.scannedAt
+		? Date.parse(projectSnapshot.scannedAt)
+		: undefined;
+	const projectScanObservedAt =
+		parsedProjectScanObservedAt !== undefined &&
+		Number.isFinite(parsedProjectScanObservedAt)
+		? parsedProjectScanObservedAt
+		: undefined;
+	for (const summary of summaries) {
+		reconcileCorrelatedScanDiagnostics(
+			summary.filePath,
+			summary.diagnostics,
+			nextWriteIndex?.(),
+			projectScanObservedAt,
+		);
+	}
 	const result = formatAllMode(cwd, severity, summaries, {
 		mode: "full",
 		lspFilesChecked: rawLspResults.length,
@@ -1668,6 +1862,21 @@ async function formatFullMode(
 					.join(
 						", ",
 					)}${unconfirmedLspResults.length > 20 ? ", …" : ""}. These files' LSP contribution is excluded from this result; re-run mode=full to retry them (they may still show findings above from cached/project-runner state).`
+			: "";
+	// Code-unit comparator (#1883): this list ships as the
+	// `unconfirmedLspServerIds` structured field and as the lane names in the
+	// agent-visible coverage note, so its order must be deterministic across
+	// locales — localeCompare is deliberately avoided.
+	const uncoveredScannerIds = [
+		...new Set(
+			partiallyCoveredLspResults.flatMap(
+				(result) => result.unconfirmedServerIds ?? [],
+			),
+		),
+	].sort((a, b) => Number(a > b) - Number(a < b));
+	const auxiliaryCoverageNote =
+		uncoveredScannerIds.length > 0
+			? `\n\n⚠ Auxiliary coverage incomplete: ${uncoveredScannerIds.join(", ")} did not answer for ${partiallyCoveredLspResults.length} file(s). Findings from answering servers are included; this is not a clean verdict for the named scanner lane(s).`
 			: "";
 	// #646: primary-vs-auxiliary split of the raw LSP-sweep findings (before
 	// they're merged into the widget-state summaries below), mirroring
@@ -1819,9 +2028,9 @@ async function formatFullMode(
 		? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run this call (${NOT_REQUESTED_REASON}).`
 		: options.refreshRunners === "cached"
 			? cheapScanScannedAtMs !== undefined && Number.isFinite(cheapScanScannedAtMs)
-				? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): served from cache, ${formatCacheAge(
+				? `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): served from cache, ${formatCacheAgeOld(
 						Date.now() - cheapScanScannedAtMs,
-					)} old — not re-run this call.`
+					)} — not re-run this call.`
 				: `\n\ncheap project scan (tree-sitter/fact-rules/ast-grep): not run (no cached scan; refresh with refreshRunners=cheap/all to populate).`
 			: "";
 	const abortedNote =
@@ -1856,7 +2065,7 @@ async function formatFullMode(
 	const cachedAgeNote =
 		cachedAgeEntries.length > 0
 			? `\n\nserved from cache this call (not re-run): ${cachedAgeEntries
-					.map(([id, ms]) => `${id} (${formatCacheAge(ms)} old)`)
+					.map(([id, ms]) => `${id} (${formatCacheAgeOld(ms)})`)
 					.join(", ")}.`
 			: "";
 	// coldRunners always lands in details (even when empty) so a caller can
@@ -1897,6 +2106,8 @@ async function formatFullMode(
 			// any files unconfirmed" without re-deriving it from the text.
 			lspFilesConfirmed: confirmedLspResults.length,
 			lspFilesUnconfirmed: unconfirmedLspResults.length,
+			lspFilesPartiallyCovered: partiallyCoveredLspResults.length,
+			unconfirmedLspServerIds: uncoveredScannerIds,
 			unconfirmedLspFiles: unconfirmedLspResults.map(
 				(result) => result.filePath,
 			),
@@ -1948,6 +2159,7 @@ async function formatFullMode(
 						result.content[0].text +
 						note +
 						unconfirmedLspNote +
+						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						testRunnerEditScopedNote +
@@ -1980,6 +2192,7 @@ async function formatFullMode(
 		cachedAgeNote ||
 		cheapScanStatusNote ||
 		unconfirmedLspNote ||
+		auxiliaryCoverageNote ||
 		lspPrimaryVsAuxiliaryNote
 	) {
 		return {
@@ -1989,6 +2202,7 @@ async function formatFullMode(
 					text:
 						result.content[0].text +
 						unconfirmedLspNote +
+						auxiliaryCoverageNote +
 						lspPrimaryVsAuxiliaryNote +
 						coldNote +
 						testRunnerEditScopedNote +
@@ -2010,6 +2224,7 @@ async function formatFullMode(
 	return resultWithCold;
 }
 
+// @delivery-surface: lens-diagnostics:mode-all
 function formatAllMode(
 	cwd: string,
 	severity: string,
@@ -2017,14 +2232,18 @@ function formatAllMode(
 	detailOverrides: Record<string, unknown> = { mode: "all" },
 	staleDropped = 0,
 	pathsScope?: PathsScope,
+	dependencyDemoted = 0,
 ): { content: [{ type: "text"; text: string }]; details: object } {
 	// Files changed/deleted since their diagnostics were recorded have already
 	// been dropped by reconcileStaleWidgetFiles; note them so the agent knows
 	// those aren't "clean", just un-rescanned (use mode=full to refresh).
 	const staleNote =
-		staleDropped > 0
+		(staleDropped > 0
 			? ` (${staleDropped} changed file${staleDropped === 1 ? "" : "s"} omitted as stale — use mode=full to rescan)`
-			: "";
+			: "") +
+		(dependencyDemoted > 0
+			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
+			: "");
 
 	// mode=full already actively scanned exactly the requested paths, so a zero
 	// result there IS a legitimate clean read — the cache-only note only applies
@@ -2057,13 +2276,43 @@ function formatAllMode(
 					return s;
 				return summarizeDiagnostics(s.filePath, policyKept, s.hasFinalSnapshot);
 			});
-	const visibleSummaries = dispositioned.filter((s) => includeFile(s.filePath));
+	// #1641: the single chokepoint both mode=all (cache-only `summaries`) and
+	// mode=full (widget cache merged with a FRESH LSP sweep, above) converge
+	// through — a fresh sweep's server can still be citing its own stale
+	// in-memory document, so gating only the cached half would miss exactly
+	// the live incident this issue reports. Runs AFTER dispositions/rule
+	// policy (not before): a finding a mark or a `.pi-lens.json` rule policy
+	// already dropped is not being served, so it must never trigger a resync
+	// or a `diagnostic_past_eof` telemetry record on this call.
+	const eofGated = dispositioned.map((s) => {
+		const { diagnostics, demotedCount } = demotePastEofDiagnostics({
+			store: "lens_diagnostics",
+			cwd,
+			filePath: s.filePath,
+			diagnostics: s.diagnostics ?? [],
+			resync: resyncDocumentOnPastEof,
+		});
+		if (demotedCount === 0) return s;
+		return summarizeDiagnostics(s.filePath, diagnostics, s.hasFinalSnapshot);
+	});
+	const visibleSummaries = eofGated.filter((s) => includeFile(s.filePath));
 
-	// Filter to files with actual issues
+	// Filter to files with actual issues. A file whose only findings were
+	// demoted by the #1641 past-EOF gate has blocking/errors/warnings at 0 —
+	// counting it as "issue-free" would tell the agent the file is CLEAN when
+	// it actually has an unconfirmed finding waiting on a rescan. Surface it
+	// under `severity: "all"` (the gate's own advisory tier) so it stays
+	// visible; a narrower `error`/`warning` filter still excludes it, matching
+	// how those filters already treat any other non-matching severity.
 	const withIssues = visibleSummaries.filter((s) => {
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
 		if (severity === "warning") return s.warnings > 0;
-		return s.blocking > 0 || s.errors > 0 || s.warnings > 0;
+		return (
+			s.blocking > 0 ||
+			s.errors > 0 ||
+			s.warnings > 0 ||
+			(s.diagnostics ?? []).some((d) => d.stale)
+		);
 	});
 
 	const pathsNote = isFullMode ? "" : pathsScopeCacheOnlyNote(pathsScope);
@@ -2103,6 +2352,12 @@ function formatAllMode(
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);
 		if (s.warnings > 0) parts.push(`${s.warnings}W`);
 		if (!s.hasFinalSnapshot) parts.push(`(pending)`);
+		const staleCount = (s.diagnostics ?? []).filter((d) => d.stale).length;
+		if (staleCount > 0) {
+			parts.push(
+				`${staleCount} stale — re-run to confirm`,
+			);
+		}
 		lines.push(`${rel}  ${parts.join("  ")}`);
 
 		// List the actual diagnostics (not just counts) so the agent can act on
@@ -2115,16 +2370,27 @@ function formatAllMode(
 			.sort(bySeverityThenLine);
 		const shown = matching.slice(0, MAX_DIAGNOSTICS_PER_FILE);
 		for (const d of shown) {
-			const marker = isErrorLike(d)
-				? d.semantic === "blocking"
-					? "🔴 "
-					: ""
-				: "";
+			const marker = d.stale
+				? ""
+				: isErrorLike(d)
+					? d.semantic === "blocking"
+						? "🔴 "
+						: ""
+					: "";
 			const label = d.rule ?? d.tool;
 			const tag = label ? ` [${label}]` : "";
 			const flaggedTag = d.flagged ? " 📌 flagged-to-fix" : "";
 			const msg = d.message.replace(/\s+/g, " ").trim();
-			lines.push(`  ${marker}L${d.line ?? "?"}: ${msg}${tag}${flaggedTag}`);
+			// #1641: a demoted past-EOF entry no longer has a trustworthy line —
+			// show the marker instead of a coordinate that doesn't exist in the
+			// current file, matching the #1622/#1627 stale-line render convention.
+			// Past-EOF demotions replace the untrustworthy coordinate; other
+			// demotions (#1631 drift) keep their in-bounds line and append the
+			// shared stale marker instead.
+			const pastEof = d.stale && (d.staleReason ?? "past-eof") === "past-eof";
+			const loc = pastEof ? PAST_EOF_STALE_MARKER : `L${d.line ?? "?"}`;
+			const staleTag = d.stale && !pastEof ? ` ${STALE_LINE_MARKER}` : "";
+			lines.push(`  ${marker}${loc}: ${msg}${tag}${flaggedTag}${staleTag}`);
 		}
 		if (matching.length > shown.length) {
 			lines.push(
@@ -2137,12 +2403,20 @@ function formatAllMode(
 		totalWarnings += s.warnings;
 	}
 
+	// #1799: `totalBlocking` and `totalErrors` count the same findings UNLESS a
+	// dependency-drift demotion (#1631) has revoked blocking authority from an
+	// error while leaving it in the error tally (widget-state.ts `isBlocking`
+	// vs `countDiagnostics`) — that's a real, live disagreement between the two
+	// totals, not double-counting. So `errors` renders only when
+	// `blocking === 0`, same guard as the per-file row above: it shows the
+	// drift-demoted findings the blocking line can't, without ever printing the
+	// same findings twice under two labels when blocking > 0.
 	const summary = [
 		`\nSummary (${visibleSummaries.length} files diagnosed this session):`,
 		totalBlocking > 0
 			? `  🔴 ${totalBlocking} blocking error${totalBlocking === 1 ? "" : "s"}`
 			: null,
-		totalErrors > 0
+		totalBlocking === 0 && totalErrors > 0
 			? `  ${totalErrors} error${totalErrors === 1 ? "" : "s"}`
 			: null,
 		totalWarnings > 0

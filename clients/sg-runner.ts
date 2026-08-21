@@ -16,6 +16,7 @@ import {
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
+import { createSingleFlight } from "./single-flight.js";
 import {
 	type AvailabilityCause,
 	type ProbeEvidence,
@@ -191,7 +192,11 @@ export class SgRunner {
 	 * restart and paid for an install nobody needed.
 	 */
 	private readonly availabilityLatch = createAvailabilityLatch();
-	private ensureInFlight: Promise<boolean> | null = null;
+	/**
+	 * At-most-one sweep in flight, via the shared primitive (#1753). One
+	 * instance owns one question, so the key is a constant.
+	 */
+	private readonly ensureFlight = createSingleFlight<boolean>();
 	/**
 	 * Whether a DIRECT candidate — one that would have been ast-grep itself —
 	 * failed for a transient reason in the current sweep. Only these block the
@@ -221,6 +226,15 @@ export class SgRunner {
 	private sweepFallbackCause: AvailabilityCause = "probe-timeout";
 	/** Host stall summed over every probe of the current sweep, ms. */
 	private sweepHostStallMs = 0;
+	/**
+	 * Candidates — direct or fallback — that this sweep probed and found
+	 * DURABLY missing (real ENOENT/non-installable, not a stall) (#1593). The
+	 * retained-arm fallback below only sees whether SOME candidate stalled; this
+	 * list lets it also check whether the memoized winner itself is one of the
+	 * candidates this very sweep just disproved, rather than re-serving a
+	 * command that ENOENTed a moment ago because an unrelated sibling stalled.
+	 */
+	private sweepDurablyMissing: string[] = [];
 
 	constructor(verbose = false) {
 		this.log = verbose
@@ -231,24 +245,19 @@ export class SgRunner {
 	/**
 	 * Check if ast-grep CLI is available, auto-install if not.
 	 *
-	 * Re-entrancy safe: concurrent first-time callers share a single
-	 * `ensureInFlight` promise so probing/auto-install isn't duplicated
-	 * across session-start tasks. Mirrors the dedupe pattern in
-	 * `KnipClient.ensureAvailable` and `DependencyChecker.ensureAvailable`.
+	 * Re-entrancy safe: concurrent first-time callers share one flight, so
+	 * probing/auto-install isn't duplicated across session-start tasks. The
+	 * share and the clear-in-finally belong to `singleFlight` (#1753); this
+	 * method owns only the latch short-circuit above it. The sweep-local
+	 * bookkeeping `doEnsureAvailable` resets on entry is untouched — it is
+	 * per-sweep state, not concurrency state.
 	 */
 	async ensureAvailable(): Promise<boolean> {
 		// Fast path: already decided. `read()` returns null when the last verdict
 		// was transient and its cooldown expired, which re-enters the sweep.
 		const memo = this.availabilityLatch.read();
 		if (memo !== null) return memo;
-		if (this.ensureInFlight) return this.ensureInFlight;
-
-		this.ensureInFlight = this.doEnsureAvailable();
-		try {
-			return await this.ensureInFlight;
-		} finally {
-			this.ensureInFlight = null;
-		}
+		return this.ensureFlight.run("ast-grep", () => this.doEnsureAvailable());
 	}
 
 	private async doEnsureAvailable(): Promise<boolean> {
@@ -259,6 +268,7 @@ export class SgRunner {
 		this.sweepFallbackTransient = false;
 		this.sweepFallbackCause = "probe-timeout";
 		this.sweepHostStallMs = 0;
+		this.sweepDurablyMissing = [];
 
 		// Step 1: PATH — canonical binary names + npx fallback.
 		// Prefer ast-grep over sg on Linux: /usr/bin/sg is util-linux, not ast-grep.
@@ -332,7 +342,13 @@ export class SgRunner {
 			// run #1476 backwards — a timeout erasing a positive result — and it
 			// would send the sweep on to Step 4 to install a tool that is already
 			// runnable. Keep the winner and re-arm the cooldown (#1568 review F1).
-			if (this.availabilityLatch.isProvisional() && this.sgPath) {
+			// #1593: a sibling tier stalling this sweep is not license to re-serve
+			// a winner that THIS SAME sweep just proved durably missing.
+			if (
+				this.availabilityLatch.isProvisional() &&
+				this.sgPath &&
+				!this.sweepDurablyMissing.includes(this.sgPath)
+			) {
 				this.noteAvailable(
 					startedAt,
 					`ast-grep re-probe stalled; keeping ${this.sgPath}`,
@@ -610,6 +626,8 @@ export class SgRunner {
 					this.sweepUnreachable.push(name);
 				}
 			}
+		} else if (!this.sweepDurablyMissing.includes(cmd)) {
+			this.sweepDurablyMissing.push(cmd);
 		}
 		return false;
 	}

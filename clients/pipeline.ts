@@ -15,7 +15,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { PiLensFlagSource } from "./lens-config.js";
-import { findNearestContaining } from "./path-utils.js";
+import { findNearestContaining, normalizeEphemeralMapKey } from "./path-utils.js";
 import {
 	recordFromDispatchDiagnostic,
 	type ActionableWarningRecord,
@@ -53,6 +53,7 @@ import {
 } from "./file-utils.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
+import type { PostAutofixNotice } from "./post-autofix-notice.js";
 import { emitLensAnalysisComplete } from "./lens-events.js";
 import { publishFilesTouched } from "./bus-publish.js";
 import {
@@ -323,6 +324,18 @@ export interface PipelineResult {
 	 * retire the record (see `retireInlineBlockerOnConfirmedClean`).
 	 */
 	inlineBlockerSources?: string[];
+	/**
+	 * #1641 remainder: the 1-based cited lines of the blockers behind
+	 * `inlineBlockerSummary`, carried structurally instead of re-parsed from the
+	 * rendered text later. Cheap here — `dispatchResult.blockers` already has
+	 * `.line` on each diagnostic from this same dispatch; re-deriving it by
+	 * regexing the summary string at turn end would be the re-derivation-vs-
+	 * correlation screen's exact failure shape (a line embedded in prose is not
+	 * reliably parseable, and dispatcher-side rendering changes would silently
+	 * break it). Omits entries with no line (a blocker that doesn't cite one,
+	 * e.g. a whole-file secret finding).
+	 */
+	inlineBlockerLines?: number[];
 	/** Fixable warning diagnostics introduced by this pipeline run. */
 	actionableWarnings?: ActionableWarningRecord[];
 	/** Non-fixable code-quality warnings introduced/touched by this pipeline run. */
@@ -341,6 +354,18 @@ export interface PipelineResult {
 	autofixTools?: string[];
 	/** Authoritative bytes after an immediate mutation of the target file. */
 	postMutation?: { filePath: string; content: string; source: "autofix" };
+	/**
+	 * Data for the post-autofix "the file on disk changed" notice (#1590).
+	 *
+	 * The pipeline renders no sentence of its own here. Whether the
+	 * authoritative bytes actually shipped is decided one layer up, in
+	 * `handleToolResult`, which is the only place that sees the per-file
+	 * attachment cap and the per-command aggregate budget. The pipeline
+	 * therefore emits the DATA (display paths it already resolved) and
+	 * `renderPostAutofixNotice` turns it into exactly one sentence under that
+	 * one decision. Present when auto-format or autofix changed content.
+	 */
+	postAutofixNotice?: PostAutofixNotice;
 }
 
 // --- Phase timing helpers ---
@@ -1043,6 +1068,25 @@ export async function resyncLspFile(
 			if (outcome === "bailed") {
 				// Abandon the still-pending write; the edit continues. Log it so this
 				// stall — previously an invisible hang — is queryable in latency.log.
+				//
+				// #1766: a resync deadline can expire while the target server's FIRST
+				// spawn is still in flight (cold spawn > budget). That is not the same
+				// state as a running server that stalled on a write — the server the
+				// old wording blamed as "slow/wedged" did not exist yet. Distinguish
+				// the two via a fresh, synchronous inFlight lookup so the record keeps
+				// the discriminating identity (which server, which lifecycle state).
+				// Guarded: a test double or future service shape lacking the method
+				// must degrade to the old "timeout"/slow-wedged wording, not throw
+				// into the catch below and suppress this record entirely (#1766 F3).
+				const spawnInFlight =
+					!abort?.aborted &&
+					typeof lspService.isSpawnInFlight === "function" &&
+					lspService.isSpawnInFlight(filePath);
+				const reason = abort?.aborted
+					? "aborted"
+					: spawnInFlight
+						? "spawn-in-flight"
+						: "timeout";
 				logLatency({
 					type: "phase",
 					phase: "lsp_sync_abandoned",
@@ -1050,13 +1094,16 @@ export async function resyncLspFile(
 					durationMs: Date.now() - startedAt,
 					metadata: {
 						source: "lsp_sync",
-						reason: abort?.aborted ? "aborted" : "timeout",
+						reason,
 						budgetMs,
 					},
 				});
-				dbg(
-					`LSP resync ${abort?.aborted ? "aborted (Escape)" : `timed out after ${budgetMs}ms`}; server slow/wedged for ${filePath}`,
-				);
+				const cause = abort?.aborted
+					? "aborted (Escape)"
+					: spawnInFlight
+						? `timed out after ${budgetMs}ms; reason: spawn-in-flight (server still cold-spawning)`
+						: `timed out after ${budgetMs}ms; server slow/wedged`;
+				dbg(`LSP resync ${cause} for ${filePath}`);
 			}
 		}
 	} catch (err) {
@@ -1471,30 +1518,19 @@ export async function runPipeline(
 				: "";
 		output += `\n\n⚠️ Auto-format failed: ${details}${suffix}`;
 	}
-	if (formatChanged || fixedCount > 0) {
-		const changedList = [...piChangedFiles].map((changedFile) =>
-			toRunnerDisplayPath(cwd, changedFile),
-		);
-		const topFiles = changedList
-			.slice(0, 8)
-			.map((f) => "  - " + f)
-			.join("\n");
-		const overflow =
-			changedList.length > 8
-				? "\n  - ... and " + (changedList.length - 8) + " more"
-				: "";
-		const fileList = changedList.length
-			? "\nModified files:\n" + topFiles + overflow
-			: "";
-		const targetHasAuthoritativeAttachment =
-			ctx.autofixMode !== "deferred" &&
-			autofixChangedFiles.some(
-				(changedFile) => path.resolve(changedFile) === path.resolve(filePath),
-			);
-		output += targetHasAuthoritativeAttachment
-			? `\n\n⚠️ **The attached full content for ${toRunnerDisplayPath(cwd, filePath)} is authoritative after autofix. You MUST re-read any other modified side-effect files before editing them.**${fileList}`
-			: `\n\n⚠️ **File was modified by auto-format/fix. You MUST re-read modified file(s) before making any further edits — the content on disk has changed (whitespace, indentation, quotes, or code). Editing from memory will produce mismatches.**${fileList}`;
-	}
+	// #1590: the notice sentence itself is NOT rendered here. This layer cannot
+	// see the attachment cap or the aggregate budget, so it hands the display
+	// paths to `handleToolResult`, which owns the decision and renders the one
+	// sentence with `renderPostAutofixNotice`.
+	const postAutofixNotice: PostAutofixNotice | undefined =
+		formatChanged || fixedCount > 0
+			? {
+					targetPath: toRunnerDisplayPath(cwd, filePath),
+					changedFiles: [...piChangedFiles].map((changedFile) =>
+						toRunnerDisplayPath(cwd, changedFile),
+					),
+				}
+			: undefined;
 	phase.end("dispatch_lint", {
 		hasOutput: !!dispatchResult.output,
 		diagnosticCount: dispatchResult.diagnostics.length,
@@ -1547,7 +1583,10 @@ export async function runPipeline(
 
 	// --- Final timing + all-clear ---
 	const elapsed = Date.now() - pipelineStart;
-	if (!output) {
+	// #1590: `postAutofixNotice` is output this run produces, just rendered a
+	// layer up. Treat it as output here, or a format-only change would newly
+	// gain an "all clear" line it never had while the sentence lived inline.
+	if (!output && !postAutofixNotice) {
 		output = buildAllClearOutput(dispatchResult, elapsed, filePath);
 	}
 
@@ -1596,12 +1635,48 @@ export async function runPipeline(
 					),
 				]
 			: undefined,
+		inlineBlockerLines: dispatchResult.hasBlockers
+			? dispatchResult.blockers
+					// #1641 review F2: `dispatchResult.blockers` is NOT guaranteed to be
+					// scoped to THIS file — a chart-wide runner (helm-lint, helm-render)
+					// reports blocking diagnostics against other files in the chart
+					// (e.g. `values.yaml`) alongside `ctx.filePath`. The precedent every
+					// per-file runner already follows (dotnet-build.ts, javac.ts) is to
+					// drop cross-file rows before they reach a per-file record; this is
+					// that same filter applied at the aggregation point instead, since
+					// `blockers` is pooled across every runner dispatched for this file.
+					// Without it, a cross-file line count gets attributed to THIS
+					// file's past-EOF check and can demote an in-bounds, fully valid
+					// blocker for content the diagnostic never described.
+					//
+					// #1641 review round 2 (LOW): `path.resolve` equality doesn't fold
+					// case, and an LSP-sourced diagnostic's `filePath` is stamped with
+					// realpath canonical casing (dispatch/runners/lsp.ts ->
+					// normalizeMapKey) while `ctx.filePath` can arrive lowercase-drive
+					// on Windows — the drive-letter class from #1139/#1150. A bare
+					// `path.resolve` equality then drops EVERY LSP blocker line and
+					// this record silently skips the past-EOF gate (fail-open, but
+					// exactly the pre-fix behavior on the surface #1641 targets).
+					// `normalizeEphemeralMapKey` slash-folds and (on win32)
+					// lowercase-folds both sides with no filesystem I/O — cheap enough
+					// for this per-blocker hot-path filter. `pathsEqual` was
+					// deliberately NOT used here: it calls `realpathSync` per
+					// comparison, which this filter cannot afford per blocker.
+					.filter(
+						(d) =>
+							normalizeEphemeralMapKey(d.filePath) ===
+							normalizeEphemeralMapKey(filePath),
+					)
+					.map((d) => d.line)
+					.filter((line): line is number => typeof line === "number")
+			: undefined,
 		actionableWarnings,
 		codeQualityWarnings,
 		diagnostics: dispatchResult.diagnostics,
 		formattersUsed,
 		fixedCount,
 		autofixTools,
+		postAutofixNotice,
 		postMutation:
 			ctx.autofixMode !== "deferred" && autofixChangedFiles.some((f) => path.resolve(f) === path.resolve(filePath)) && fileContent !== undefined
 				? { filePath: path.resolve(filePath), content: fileContent, source: "autofix" }
