@@ -41,6 +41,7 @@ import {
 	shouldAutoInstallTool,
 } from "../../../tool-policy.js";
 import type { DispatchContext } from "../../types.js";
+import { isInSpawnTimeoutCooldown } from "../../../spawn-timeout-cooldown.js";
 import {
 	type AvailabilityCause,
 	type AvailabilityLatch,
@@ -461,7 +462,9 @@ export async function getManagedToolEnvironment(
 }
 
 /** Read-only managed/PATH discovery for spawn-time resolution memos. */
-export async function discoverManagedTool(toolId: string): Promise<string | null> {
+export async function discoverManagedTool(
+	toolId: string,
+): Promise<string | null> {
 	return (await ensureTool(toolId, { allowInstall: false })) ?? null;
 }
 
@@ -1009,6 +1012,27 @@ export function createAvailabilityChecker(
 			}
 
 			const cmd = await findCommand(resolvedCwd);
+			// #1995: a command cooling down after a RUNTIME timeout (lint or
+			// autofix lane blew its real budget) must not re-probe on every
+			// edit - the positive verdict is effectively cooled. Consult-only:
+			// probe timeouts do NOT arm the cooldown here, because a single
+			// slow --version under host stall (#1467) is transient evidence,
+			// and session-long suppression from it would contradict the
+			// #1494 retry ladder this classification exists for.
+			if (isInSpawnTimeoutCooldown(cmd)) {
+				noteDecision(cache, resolvedCwd, {
+					available: false,
+					outcome: "transient",
+					cause: "probe-timeout",
+					elapsedMs: 0,
+					classifiedBy: "caller",
+					evidence: {
+						command: cmd,
+						status: null,
+					},
+				});
+				return false;
+			}
 			const env = await options.environment?.(resolvedCwd);
 			// The probe budget is enforced by a HOST-side timer, so host event-loop
 			// stalls are charged to the child. Measure the stall that overlapped the
@@ -1094,7 +1118,8 @@ export function createAvailabilityChecker(
 			cause: cache.cause,
 			elapsedMs: cache.elapsedMs,
 			latched:
-				cache.available !== false || isLatchingOutcome(cache.outcome ?? "missing"),
+				cache.available !== false ||
+				isLatchingOutcome(cache.outcome ?? "missing"),
 			retryAtMs: cache.retryAtMs,
 		};
 	}
@@ -1564,17 +1589,19 @@ export function resolveAvailableOrInstall(
 	// primitive (#1754): a settling old-session transaction must not evict the
 	// entry a NEW session already installed for this (cwd, tool).
 	const generation = availabilityGeneration.capture();
-	const promise = resolveAvailableOrInstallUnshared(checker, toolId, cwd).finally(
-		() => {
-			generation.guardedWrite(`${toolId}@${key}`, () => {
-				const current = resolveInstallInFlightByCwd.get(key);
-				if (current?.get(toolId) === promise) {
-					current.delete(toolId);
-					if (current.size === 0) resolveInstallInFlightByCwd.delete(key);
-				}
-			});
-		},
-	);
+	const promise = resolveAvailableOrInstallUnshared(
+		checker,
+		toolId,
+		cwd,
+	).finally(() => {
+		generation.guardedWrite(`${toolId}@${key}`, () => {
+			const current = resolveInstallInFlightByCwd.get(key);
+			if (current?.get(toolId) === promise) {
+				current.delete(toolId);
+				if (current.size === 0) resolveInstallInFlightByCwd.delete(key);
+			}
+		});
+	});
 	byTool.set(toolId, promise);
 	return promise;
 }
@@ -1716,7 +1743,9 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		// 1. Local node_modules/.bin
 		for (const localBin of buildSgLocalBins()) {
 			if (await probeAstGrepCommandAsync(localBin)) {
-				sgCmd = localBin; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = localBin;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
@@ -1724,7 +1753,9 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		// 2. Global PATH
 		for (const cmd of ["ast-grep", "sg"]) {
 			if (await probeAstGrepCommandAsync(cmd)) {
-				sgCmd = cmd; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = cmd;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
@@ -1734,14 +1765,18 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		for (const name of ["ast-grep", "sg"]) {
 			const globalBin = await findGlobalBinary(name);
 			if (globalBin && (await probeAstGrepCommandAsync(globalBin))) {
-				sgCmd = globalBin; sgCmdArgs = []; noteSgAvailable(startedAt);
+				sgCmd = globalBin;
+				sgCmdArgs = [];
+				noteSgAvailable(startedAt);
 				return true;
 			}
 		}
 
 		// 3. npx --no (cache-only, no silent download).
 		if (await probeAstGrepCommandAsync("npx", ["--no", "--", "ast-grep"])) {
-			sgCmd = "npx"; sgCmdArgs = ["--no", "--", "ast-grep"]; noteSgAvailable(startedAt);
+			sgCmd = "npx";
+			sgCmdArgs = ["--no", "--", "ast-grep"];
+			noteSgAvailable(startedAt);
 			return true;
 		}
 

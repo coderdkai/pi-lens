@@ -13,7 +13,8 @@ import {
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
 import type { ToolExitCodes } from "./utils/spawn-outcome.js";
-import { skipUnlessToolRan } from "./utils/tool-failure.js";
+import { parseToolRun } from "./utils/tool-failure.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 const mypy = createAvailabilityChecker("mypy", "");
 
@@ -88,7 +89,7 @@ const mypyRunner: RunnerDefinition = {
 		}
 
 		let cmd: string | null = null;
-		if (await (mypy.isAvailableAsync(cwd))) {
+		if (await mypy.isAvailableAsync(cwd)) {
 			cmd = mypy.getCommand(cwd);
 		} else {
 			cmd = await resolveToolCommandWithInstallFallback(cwd, "mypy");
@@ -107,24 +108,25 @@ const mypyRunner: RunnerDefinition = {
 		// stdout only (see MYPY_EXIT_CODES) so an exit-2 SYNTAX error, which
 		// does write a diagnostic there, still reaches the parser.
 		const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
-		const skipped = skipUnlessToolRan("mypy", {
+		// #1948: `parseOutput` keeps the split this runner already had — the gate
+		// judges "did it run" on stdout alone, the parser still reads both
+		// streams — so adding the parsed-nothing record does not widen the
+		// did-it-run verdict.
+		const run = parseToolRun(
+			"mypy",
+			{ result, output: result.stdout, exitCodes: MYPY_EXIT_CODES },
+			(out) => parseMypyOutput(out, ctx.filePath, cwd),
+			{ parseOutput: raw },
+		);
+		if (run.skipped) return run.skipped;
+
+		const diagnostics = run.diagnostics;
+		return finishParsedRun({
+			tool: "mypy",
+			ctx,
 			result,
-			output: result.stdout,
-			exitCodes: MYPY_EXIT_CODES,
-		});
-		if (skipped) return skipped;
-
-		const diagnostics = parseMypyOutput(raw, ctx.filePath, cwd);
-		if (diagnostics.length === 0) {
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
-		}
-
-		const hasBlocking = diagnostics.some((d) => d.semantic === "blocking");
-		return {
-			status: hasBlocking ? "failed" : "succeeded",
 			diagnostics,
-			semantic: hasBlocking ? "blocking" : "warning",
-		};
+		});
 	},
 };
 

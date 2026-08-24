@@ -152,6 +152,20 @@ const mockSpawn = vi.hoisted(() =>
 
 vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
 
+// #2015: verifyToolBinary probes (and installNpmTool's npm-install spawn)
+// route through `safeSpawnAsync`, so this file mocks that seam directly and
+// records every invocation into the same `spawnCalls` log the raw-spawn mock
+// above feeds. Probes and installs both answer success; tests that need a
+// failure simulate it at their own seams (network, fs access).
+vi.mock("../../../clients/safe-spawn.js", () => ({
+	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
+	safeSpawnAsync: async (command: string, args: string[]) => {
+		spawnCalls.push({ cmd: String(command), args: args ?? [] });
+		return { stdout: "", stderr: "", status: 0 };
+	},
+	resetSafeSpawnWindowsCommandCache: vi.fn(),
+}));
+
 // ── https mock ──────────────────────────────────────────────────────────
 // Keep the suite hermetic: installTool's github path does a real GitHub API
 // fetch via node:https. Without this mock the install tests depend on the
@@ -178,7 +192,10 @@ const mockHttpsGet = vi.hoisted(() => (url: unknown) => {
 	};
 	return req;
 });
-vi.mock("node:https", () => ({ default: { get: mockHttpsGet }, get: mockHttpsGet }));
+vi.mock("node:https", () => ({
+	default: { get: mockHttpsGet },
+	get: mockHttpsGet,
+}));
 
 // #1276: `finishInstallAttempt` calls this on a successful install, mirroring
 // `resetSafeSpawnWindowsCommandCache` right above it. Mocked so the wiring
@@ -248,7 +265,9 @@ const savedPiLensHome = process.env.PI_LENS_HOME;
 let restoreDisableToolInstall: () => void;
 
 beforeEach(() => {
-	restoreDisableToolInstall = withEnv({ PI_LENS_DISABLE_TOOL_INSTALL: undefined });
+	restoreDisableToolInstall = withEnv({
+		PI_LENS_DISABLE_TOOL_INSTALL: undefined,
+	});
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
@@ -475,9 +494,8 @@ describe("ensureTool allowInstall policy", () => {
 
 describe("ensureTool force-reinstall", () => {
 	it("does not return the stale cached path after forceReinstall", async () => {
-		const { updateProbeCache } = await import(
-			"../../../clients/installer/index.js"
-		);
+		const { updateProbeCache } =
+			await import("../../../clients/installer/index.js");
 		// Use a path that can't collide with a real tool on PATH
 		const stalePath = "/fake/stale/rust-analyzer";
 

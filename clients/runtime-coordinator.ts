@@ -6,6 +6,11 @@ import type { FunctionCallGraph } from "./call-graph.js";
 import type { WordIndex } from "./word-index.js";
 import type { CascadeRun } from "./cascade-types.js";
 import { logCascade } from "./cascade-logger.js";
+import {
+	appendProjectChange,
+	type ProjectChangeRange,
+	type ProjectChangeSource,
+} from "./project-changes.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
@@ -27,6 +32,33 @@ export interface CascadeSessionStats {
 	diagnosticsSurfaced: number;
 	coldSnapshotTouches: number;
 }
+
+/**
+ * One attributed mutation, recorded by {@link RuntimeCoordinator.recordProjectMutation}
+ * alongside its projectSeq bump. This is the in-memory receipt for "who touched
+ * this file, when, through which path" — the queryable twin of the durable
+ * change-log entry. Consumers derive mutation answers from
+ * {@link RuntimeCoordinator.getMutationsSince} instead of re-walking the JSONL.
+ */
+export interface MutationReceipt {
+	/** projectSeq stamped by the bump this receipt rode on. */
+	seq: number;
+	/** normalizeMapKey + resolve form — same as getFilesChangedSince keys. */
+	filePath: string;
+	source: ProjectChangeSource;
+	turnIndex: number;
+	ts: number;
+}
+
+/**
+ * Bounded receipt ring capacity (defect shape 9: bound the axis that grows —
+ * per-mutation receipts are unbounded across a long session). Oldest receipts
+ * evict first; eviction is counted and surfaced via
+ * {@link RuntimeCoordinator.droppedMutationReceiptCount} so a consumer that
+ * needs a complete window knows the answer was truncated, never silently
+ * incomplete (#936 honesty rule).
+ */
+const MAX_MUTATION_RECEIPTS = 512;
 
 export type DeferredMutationKind = "autofix" | "format";
 
@@ -237,8 +269,12 @@ export class RuntimeCoordinator {
 	private _complexityBaselines = new Map<string, FileComplexity>();
 	private readonly _fixedThisTurn = new PathKeyedMap<true>(normalizeMapKey);
 	private readonly _writtenThisTurn = new PathKeyedMap<true>(normalizeMapKey);
-	private readonly _autofixDemotedThisTurn = new PathKeyedMap<true>(normalizeMapKey);
+	private readonly _autofixDemotedThisTurn = new PathKeyedMap<true>(
+		normalizeMapKey,
+	);
 	private readonly _reportedThisTurn = new Set<string>();
+	private _mutationReceipts: MutationReceipt[] = [];
+	private _droppedMutationReceipts = 0;
 	private _projectRulesScan: RuleScanResult = {
 		rules: [],
 		hasCustomRules: false,
@@ -276,9 +312,8 @@ export class RuntimeCoordinator {
 	callGraph: FunctionCallGraph | null = null;
 	wordIndex: WordIndex | null = null;
 	private _readGuard: ReadGuard | null = null;
-	private readonly _pendingDeferredMutations = new PathKeyedMap<DeferredMutationRecord>(
-		normalizeMapKey,
-	);
+	private readonly _pendingDeferredMutations =
+		new PathKeyedMap<DeferredMutationRecord>(normalizeMapKey);
 	/** tool_call → tool_result path-attribution correlation (#1642). */
 	private readonly _toolCallAttributions = new BoundedLruCache<
 		string,
@@ -325,6 +360,8 @@ export class RuntimeCoordinator {
 		this._writtenThisTurn.clear();
 		this._autofixDemotedThisTurn.clear();
 		this._reportedThisTurn.clear();
+		this._mutationReceipts = [];
+		this._droppedMutationReceipts = 0;
 		this._telemetrySessionId = `lens-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
 		this._hasStableSessionId = false;
 		this._telemetryModel = "unknown";
@@ -387,10 +424,11 @@ export class RuntimeCoordinator {
 		const summaries = this.getInlineBlockersSnapshot()
 			.map((entry) => entry.summary.trim())
 			.filter(Boolean);
-		this._gitGuardSummary = (summaries[0] ?? firstLine ?? "Unresolved blockers detected").slice(
-			0,
-			160,
-		);
+		this._gitGuardSummary = (
+			summaries[0] ??
+			firstLine ??
+			"Unresolved blockers detected"
+		).slice(0, 160);
 	}
 
 	get gitGuardHasBlockers(): boolean {
@@ -460,6 +498,77 @@ export class RuntimeCoordinator {
 		this._reportedThisTurn.clear();
 		this._writtenThisTurn.clear();
 		this._autofixDemotedThisTurn.clear();
+	}
+
+	/**
+	 * THE one mutation seam. Every producer of an in-project file mutation —
+	 * native write/edit, recognized bash writes, format/autofix, LSP workspace
+	 * edits, and (phase 2) opaque script-write recovery — records through here,
+	 * once: it bumps the seq store (`bumpFileSeq`), appends a bounded attributed
+	 * receipt, and optionally appends the durable change-log entry. Consumers
+	 * derive from `getFilesChangedSince` / `getMutationsSince`; no producer or
+	 * consumer may hand-roll a parallel bump+log pairing (#2000 phase 1).
+	 *
+	 * Receipt recording never throws; change-log append failures route to
+	 * `onAppendError` (default: swallowed) so telemetry cannot break dispatch.
+	 */
+	recordProjectMutation(args: {
+		filePath: string;
+		source: ProjectChangeSource;
+		/** When set, a durable change-log entry is appended for this cwd. */
+		cwd?: string;
+		changedRange?: ProjectChangeRange;
+		onAppendError?: (err: unknown) => void;
+	}): { projectSeq: number; fileSeq: number } {
+		const { projectSeq, fileSeq, key } = this.bumpFileSeq(args.filePath);
+		if (this._mutationReceipts.length >= MAX_MUTATION_RECEIPTS) {
+			this._mutationReceipts.shift();
+			this._droppedMutationReceipts += 1;
+		}
+		this._mutationReceipts.push({
+			seq: projectSeq,
+			// Reuse the bump's normalized key (~200us realpath on Windows) —
+			// never re-derive it here.
+			filePath: key,
+			source: args.source,
+			turnIndex: this._turnIndex,
+			ts: Date.now(),
+		});
+		if (args.cwd !== undefined) {
+			try {
+				appendProjectChange(args.cwd, {
+					seq: projectSeq,
+					timestamp: new Date().toISOString(),
+					sessionId: this.telemetrySessionId,
+					turnIndex: this.turnIndex,
+					source: args.source,
+					filePath: path.resolve(args.filePath),
+					fileSeq,
+					changedRange: args.changedRange,
+				});
+			} catch (err) {
+				args.onAppendError?.(err);
+			}
+		}
+		return { projectSeq, fileSeq };
+	}
+
+	/**
+	 * Attributed mutations whose seq is strictly after `seq` — the receipt-level
+	 * counterpart of {@link getFilesChangedSince}. Bounded: entries evicted by
+	 * the ring cap are gone; compare `droppedMutationReceiptCount` against zero
+	 * before treating the result as a complete window.
+	 */
+	getMutationsSince(seq: number): MutationReceipt[] {
+		// Shallow copies: a consumer mutating a returned receipt must not
+		// corrupt the ring's internal state.
+		return this._mutationReceipts
+			.filter((r) => r.seq > seq)
+			.map((r) => ({ ...r }));
+	}
+
+	get droppedMutationReceiptCount(): number {
+		return this._droppedMutationReceipts;
 	}
 
 	/** Atomically records write/edit ordering before debounce can coalesce it. */
@@ -540,10 +649,7 @@ export class RuntimeCoordinator {
 	 * a fresh random id), so the stable id — when pi provides one via
 	 * `ctx.sessionManager.getSessionId()` — wins and survives a quit→resume.
 	 */
-	setSessionLifecycle(args: {
-		sessionId?: string;
-		reason?: string;
-	}): void {
+	setSessionLifecycle(args: { sessionId?: string; reason?: string }): void {
 		if (args.sessionId && args.sessionId.trim()) {
 			this._telemetrySessionId = args.sessionId.trim();
 			this._hasStableSessionId = true;
@@ -609,13 +715,20 @@ export class RuntimeCoordinator {
 		}
 	}
 
-	bumpFileSeq(filePath: string): { projectSeq: number; fileSeq: number } {
+	bumpFileSeq(filePath: string): {
+		projectSeq: number;
+		fileSeq: number;
+		/** The normalized key the bump was recorded under — reuse, never re-derive. */
+		key: string;
+	} {
+		// normalizeMapKey costs ~200us/call on Windows (realpath); every caller
+		// that also needs the key must reuse this one instead of paying it twice.
 		const key = normalizeMapKey(path.resolve(filePath));
 		this._projectSeq += 1;
 		const fileSeq = (this._fileSeq.get(key) ?? 0) + 1;
 		this._fileSeq.set(key, fileSeq);
 		this._fileLastProjectSeq.set(key, this._projectSeq);
-		return { projectSeq: this._projectSeq, fileSeq };
+		return { projectSeq: this._projectSeq, fileSeq, key };
 	}
 
 	/**
@@ -730,7 +843,8 @@ export class RuntimeCoordinator {
 	 */
 	getTurnEndCascadeSettleStart(): number | undefined {
 		let latest: number | undefined;
-		for (const start of this._turnEndCascadeSettleStarts.values()) latest = start;
+		for (const start of this._turnEndCascadeSettleStarts.values())
+			latest = start;
 		return latest;
 	}
 
@@ -759,8 +873,11 @@ export class RuntimeCoordinator {
 			// Track per-promise settlement so promises still in flight at the cap can be
 			// carried over. A settled entry records its run; an unsettled one is re-parked.
 			const tracked = pending.map((p) => {
-				const entry: { done: boolean; run?: CascadeRun; promise: Promise<CascadeRun> } =
-					{ done: false, promise: p };
+				const entry: {
+					done: boolean;
+					run?: CascadeRun;
+					promise: Promise<CascadeRun>;
+				} = { done: false, promise: p };
 				entry.promise = p.then((run) => {
 					entry.done = true;
 					entry.run = run;
@@ -886,13 +1003,58 @@ export class RuntimeCoordinator {
 		const existing = this._pendingInlineBlockers.get(key);
 		if (!existing) return false;
 		if (existing.stale && existing.staleReason !== "past-eof") return false;
-		const currentlyPastEof = !!existing.stale && existing.staleReason === "past-eof";
+		const currentlyPastEof =
+			!!existing.stale && existing.staleReason === "past-eof";
 		if (currentlyPastEof === isPastEof) return false;
 		this._pendingInlineBlockers.set(key, {
 			...existing,
 			stale: isPastEof,
 			staleReason: isPastEof ? "past-eof" : undefined,
 		});
+		return true;
+	}
+
+	/**
+	 * #1944: retire a past-EOF demotion after its ONE degraded delivery.
+	 *
+	 * The past-EOF gate demotes and re-arms, but nothing ever retired the
+	 * record, so a blocker whose file shrank past the cited lines re-served on
+	 * every turn end for the rest of the session — measured live at 80+
+	 * minutes on session 01a0234c. The re-serve is unbounded, not the six
+	 * turns the first evidence window suggested.
+	 *
+	 * It is unbounded because the record cannot resolve itself. The two
+	 * clearing events (`clearInlineBlockers` on a later dispatch of the same
+	 * path, `retireInlineBlockerOnConfirmedClean` on a fresh clean verdict)
+	 * both need the file to be looked at again, and the agent has no reason to
+	 * look: the coordinates it was handed do not exist. "Re-run to confirm" is
+	 * an instruction this record makes impossible to follow.
+	 *
+	 * So the delivery surface retires it after serving it once, degraded. That
+	 * is a DROP, which #1419's demote-not-drop rule normally forbids; the
+	 * exception is narrow and stated here. The finding was already delivered
+	 * this turn with its dead coordinates annotated, and what remains is a
+	 * message pinned to a line the file does not have. `deadLines` is required
+	 * and must be non-empty, so a record stale for any OTHER reason, or
+	 * past-EOF with no identified dead line, still stands.
+	 *
+	 * @returns true when an entry was retired — the caller records it, so the
+	 * suppression is never silent (#1432 Gap 1).
+	 */
+	retireDemotedPastEofBlocker(
+		filePath: string,
+		deadLines: readonly number[],
+	): boolean {
+		if (deadLines.length === 0) return false;
+		const key = path.resolve(filePath);
+		const existing = this._pendingInlineBlockers.get(key);
+		if (!existing) return false;
+		// Only this gate's own demotion. A dependency-drift demotion (#1631)
+		// keeps in-bounds coordinates the agent CAN re-run against, so it stays
+		// in the store until a fresh verdict clears it.
+		if (!existing.stale) return false;
+		if ((existing.staleReason ?? "past-eof") !== "past-eof") return false;
+		this._pendingInlineBlockers.delete(key);
 		return true;
 	}
 
@@ -970,8 +1132,7 @@ export class RuntimeCoordinator {
 		// Existence-checking the display path and rebuilding survivors avoids
 		// the key-mismatch entirely; live survivors re-set to identical keys
 		// (both realpath), so only the stale entries are dropped.
-		const survivors: Array<[string, InlineBlockerRecord]> =
-			[];
+		const survivors: Array<[string, InlineBlockerRecord]> = [];
 		for (const [displayPath, value] of this._pendingInlineBlockers.entries()) {
 			if (fs.existsSync(displayPath)) survivors.push([displayPath, value]);
 		}
@@ -1100,9 +1261,7 @@ export class RuntimeCoordinator {
 	 * An expired entry (older than `TOOL_CALL_ATTRIBUTION_TTL_MS`) is treated
 	 * as a miss and removed rather than returned — see the constant's doc.
 	 */
-	takeToolCallAttribution(
-		toolCallId: string,
-	): ToolCallAttribution | undefined {
+	takeToolCallAttribution(toolCallId: string): ToolCallAttribution | undefined {
 		const attribution = this._toolCallAttributions.get(toolCallId);
 		if (attribution === undefined) return undefined;
 		this._toolCallAttributions.delete(toolCallId);
@@ -1285,7 +1444,8 @@ export class RuntimeCoordinator {
 			const existing = this._pendingDeferredMutations.get(key);
 			if (existing) {
 				for (const kind of record.kinds) existing.kinds.add(kind);
-				for (const toolName of record.toolNames) existing.toolNames.add(toolName);
+				for (const toolName of record.toolNames)
+					existing.toolNames.add(toolName);
 				continue;
 			}
 			this._pendingDeferredMutations.set(key, {
@@ -1359,11 +1519,13 @@ export function readHostModelIdentity(ctx: unknown): {
 	provider?: string;
 } {
 	try {
-		const model = (ctx as { model?: { id?: unknown; provider?: unknown } } | null)
-			?.model;
+		const model = (
+			ctx as { model?: { id?: unknown; provider?: unknown } } | null
+		)?.model;
 		return {
 			model: typeof model?.id === "string" ? model.id : undefined,
-			provider: typeof model?.provider === "string" ? model.provider : undefined,
+			provider:
+				typeof model?.provider === "string" ? model.provider : undefined,
 		};
 	} catch {
 		return {};

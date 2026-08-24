@@ -6,7 +6,9 @@ import { describe, expect, it } from "vitest";
 const RUNNERS_DIR = fileURLToPath(
 	new URL("../../../../clients/dispatch/runners", import.meta.url),
 );
-const CLIENTS_DIR = fileURLToPath(new URL("../../../../clients", import.meta.url));
+const CLIENTS_DIR = fileURLToPath(
+	new URL("../../../../clients", import.meta.url),
+);
 
 /** Files in the runners directory that are not runner definitions. */
 const NOT_A_RUNNER = new Set(["index.ts", "utils.ts"]);
@@ -29,7 +31,6 @@ const NOT_YET_ON_PRIMITIVE: Record<string, string> = {
 	// Spawning runners that already consult the spawn outcome with their own
 	// per-tool check. Correct today, not yet unified. #1737.
 	"actionlint.ts": "reads its own exit status; #1737 strangler",
-	"biome-check.ts": "reads its own exit status; #1737 strangler",
 	"cpp-check.ts": "reads its own exit status; #1737 strangler",
 	"credo.ts": "reads its own exit status; #1737 strangler",
 	"dart-analyze.ts": "reads its own exit status; #1737 strangler",
@@ -43,16 +44,12 @@ const NOT_YET_ON_PRIMITIVE: Record<string, string> = {
 	"helm-render.ts": "reads its own exit status; #1737 strangler",
 	"javac.ts": "reads its own exit status; #1737 strangler",
 	"ktlint.ts": "reads its own exit status; #1737 strangler",
-	"oxlint.ts": "reads its own exit status; #1737 strangler",
 	"php-lint.ts": "reads its own exit status; #1737 strangler",
-	"phpstan.ts": "reads its own exit status; #1737 strangler",
 	"prisma-validate.ts": "reads its own exit status; #1737 strangler",
 	"psscriptanalyzer.ts": "reads its own exit status; #1737 strangler",
-	"pyright.ts": "reads its own exit status; #1737 strangler",
 	"rubocop.ts": "reads its own exit status; #1737 strangler",
 	"ruff.ts": "reads its own exit status; #1737 strangler",
 	"rust-clippy.ts": "reads its own exit status; #1737 strangler",
-	"shellcheck.ts": "reads its own exit status; #1737 strangler",
 	"shfmt.ts": "reads its own exit status; #1737 strangler",
 	"spotbugs.ts": "reads its own exit status; #1737 strangler",
 	"zig-check.ts": "reads its own exit status; #1737 strangler",
@@ -76,8 +73,7 @@ describe("run-outcome primitive ratchet", () => {
 	it("every runner either uses the primitive or carries a reason", () => {
 		const unlisted = runnerFiles().filter(
 			(name) =>
-				!USES_PRIMITIVE.test(readRunner(name)) &&
-				!NOT_YET_ON_PRIMITIVE[name],
+				!USES_PRIMITIVE.test(readRunner(name)) && !NOT_YET_ON_PRIMITIVE[name],
 		);
 		expect(
 			unlisted,
@@ -104,11 +100,17 @@ describe("run-outcome primitive ratchet", () => {
 		return fs.existsSync(path.join(RUNNERS_DIR, name));
 	}
 
-	// The nine this PR fixed. Pinning them by name means a revert cannot pass
-	// by quietly adding an exemption instead.
-	it("pins the nine runners #1816 migrated", () => {
+	// The nine #1816 migrated, plus phpstan, which #1948 pulled onto the
+	// primitive while closing the parsed-nothing hole. Pinning them by name
+	// means a revert cannot pass by quietly adding an exemption instead.
+	it("pins the runners already on the primitive", () => {
 		for (const name of [
+			"biome-check.ts",
 			"go-vet.ts",
+			"oxlint.ts",
+			"phpstan.ts",
+			"pyright.ts",
+			"shellcheck.ts",
 			"markdownlint.ts",
 			"mypy.ts",
 			"spellcheck.ts",

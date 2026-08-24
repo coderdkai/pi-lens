@@ -18,7 +18,9 @@ vi.mock("../../clients/json-cache-read.js", async (importOriginal) => {
 const writeFileAtomicSpy = vi.hoisted(() => vi.fn());
 const realWriteFileAtomicHolder = vi.hoisted(() => ({
 	current: undefined as unknown as (
-		...args: Parameters<typeof import("../../clients/atomic-write.js").writeFileAtomic>
+		...args: Parameters<
+			typeof import("../../clients/atomic-write.js").writeFileAtomic
+		>
 	) => void,
 }));
 vi.mock("../../clients/atomic-write.js", async (importOriginal) => {
@@ -40,6 +42,7 @@ import {
 	getProjectSnapshotMetaPath,
 	getProjectSnapshotPath,
 	getProjectSnapshotPersistErrorForTests,
+	getProjectSnapshotPersistStateForTests,
 	getLastNarrowParseDigestForTests,
 	hydrateRuntimeFromProjectSnapshot,
 	hydrateRuntimeFromProjectSnapshotIfIdle,
@@ -58,6 +61,7 @@ import {
 	waitForProjectSnapshotPersistsForTests,
 } from "../../clients/project-snapshot.js";
 import type { ProjectSnapshot } from "../../clients/project-snapshot.js";
+import { fingerprintProjectSnapshotJson } from "../../clients/project-snapshot-fingerprint.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { buildWordIndex, searchWordIndex } from "../../clients/word-index.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
@@ -115,6 +119,24 @@ describe("project snapshot", () => {
 		delete process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC;
 	});
 
+	it("fingerprints only the top-level generatedAt field as volatile", () => {
+		const first = {
+			nested: { generatedAt: "nested-a" },
+			generatedAt: "top-a",
+			value: 1,
+		};
+		const topChanged = { ...first, generatedAt: "top-b" };
+		const nestedChanged = {
+			...topChanged,
+			nested: { generatedAt: "nested-b" },
+		};
+		const digest = (value: typeof first) =>
+			fingerprintProjectSnapshotJson(JSON.stringify(value), value.generatedAt);
+
+		expect(digest(topChanged)).toBe(digest(first));
+		expect(digest(nestedChanged)).not.toBe(digest(first));
+	});
+
 	it("builds, saves, and loads a runtime snapshot", () =>
 		withProjectDataDir((cwd) => {
 			const runtime = new RuntimeCoordinator();
@@ -146,6 +168,223 @@ describe("project snapshot", () => {
 			expect(isProjectSnapshotFresh(loaded, 7)).toBe(true);
 		}));
 
+	it("skips a same-seq body when only generatedAt changed", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const first = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, first);
+
+			writeFileAtomicSpy.mockClear();
+			saveProjectSnapshot(cwd, {
+				...first,
+				generatedAt: new Date(
+					Date.parse(first.generatedAt) + 1000,
+				).toISOString(),
+			});
+
+			const bodyWrites = writeFileAtomicSpy.mock.calls.filter(
+				([filePath]) => filePath === getProjectSnapshotPath(cwd),
+			);
+			expect(bodyWrites).toHaveLength(0);
+			expect(readProjectSnapshotMeta(cwd)?.timestamp).toBe(first.generatedAt);
+		}));
+
+	it("writes a same-seq semantic delta and repairs a missing body", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const first = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, first);
+
+			writeFileAtomicSpy.mockClear();
+			saveProjectSnapshot(cwd, {
+				...first,
+				cachedExports: [["newExport", path.join(cwd, "src", "new.ts")]],
+			});
+			expect(
+				writeFileAtomicSpy.mock.calls.filter(
+					([filePath]) => filePath === getProjectSnapshotPath(cwd),
+				),
+			).toHaveLength(1);
+
+			fs.rmSync(getProjectSnapshotPath(cwd));
+			writeFileAtomicSpy.mockClear();
+			saveProjectSnapshot(cwd, first);
+			expect(
+				writeFileAtomicSpy.mock.calls.filter(
+					([filePath]) => filePath === getProjectSnapshotPath(cwd),
+				),
+			).toHaveLength(1);
+			expect(fs.existsSync(getProjectSnapshotPath(cwd))).toBe(true);
+		}));
+
+	it("preserves a newer sibling-process body when stale local state replays", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const local = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, local);
+
+			const sibling: ProjectSnapshot = {
+				...local,
+				cachedExports: [["siblingDelta", path.join(cwd, "src", "sibling.ts")]],
+				generatedAt: new Date(
+					Date.parse(local.generatedAt) + 1000,
+				).toISOString(),
+			};
+			const siblingJson = JSON.stringify(sibling);
+			const siblingFingerprint = fingerprintProjectSnapshotJson(
+				siblingJson,
+				sibling.generatedAt,
+			);
+			realWriteFileAtomicHolder.current(
+				getProjectSnapshotPath(cwd),
+				gzipSync(siblingJson),
+				{ bestEffort: false },
+			);
+			realWriteFileAtomicHolder.current(
+				getProjectSnapshotMetaPath(cwd),
+				JSON.stringify({
+					timestamp: sibling.generatedAt,
+					version: sibling.version,
+					seq: sibling.seq,
+					fingerprint: siblingFingerprint,
+				}),
+				{ bestEffort: false },
+			);
+
+			writeFileAtomicSpy.mockClear();
+			saveProjectSnapshot(cwd, {
+				...local,
+				generatedAt: new Date(
+					Date.parse(local.generatedAt) + 2000,
+				).toISOString(),
+			});
+			expect(
+				writeFileAtomicSpy.mock.calls.filter(
+					([filePath]) => filePath === getProjectSnapshotPath(cwd),
+				),
+			).toHaveLength(0);
+			_resetProjectSnapshotParseCacheForTests();
+			expect(loadProjectSnapshot(cwd)?.cachedExports).toEqual(
+				sibling.cachedExports,
+			);
+			expect(readProjectSnapshotMeta(cwd)?.fingerprint).toBe(
+				siblingFingerprint,
+			);
+		}));
+
+	it("retries an unchanged body after a failed publication", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const snapshot = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			const bodyPath = getProjectSnapshotPath(cwd);
+			let failBody = true;
+			writeFileAtomicSpy.mockImplementation((targetPath, data, options) => {
+				if (targetPath === bodyPath && failBody) {
+					failBody = false;
+					throw new Error("injected body failure");
+				}
+				return realWriteFileAtomicHolder.current(targetPath, data, options);
+			});
+			try {
+				saveProjectSnapshot(cwd, snapshot);
+				expect(fs.existsSync(bodyPath)).toBe(false);
+				expect(getProjectSnapshotPersistErrorForTests()).toContain(
+					"injected body failure",
+				);
+
+				saveProjectSnapshot(cwd, {
+					...snapshot,
+					generatedAt: new Date(
+						Date.parse(snapshot.generatedAt) + 1000,
+					).toISOString(),
+				});
+				expect(fs.existsSync(bodyPath)).toBe(true);
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(7);
+			} finally {
+				writeFileAtomicSpy.mockImplementation(
+					realWriteFileAtomicHolder.current,
+				);
+			}
+		}));
+
+	it("does not suppress metadata repair after a same-seq body lands", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const first = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, first);
+			const priorFingerprint = readProjectSnapshotMeta(cwd)?.fingerprint;
+			const changed: ProjectSnapshot = {
+				...first,
+				cachedExports: [["changed", path.join(cwd, "src", "changed.ts")]],
+			};
+			const metaPath = getProjectSnapshotMetaPath(cwd);
+			let failMetadata = true;
+			writeFileAtomicSpy.mockImplementation((targetPath, data, options) => {
+				if (targetPath === metaPath && failMetadata) {
+					failMetadata = false;
+					throw new Error("injected metadata failure");
+				}
+				return realWriteFileAtomicHolder.current(targetPath, data, options);
+			});
+			try {
+				saveProjectSnapshot(cwd, changed);
+				expect(getProjectSnapshotPersistErrorForTests()).toContain(
+					"injected metadata failure",
+				);
+				expect(readProjectSnapshotMeta(cwd)?.fingerprint).toBe(
+					priorFingerprint,
+				);
+
+				writeFileAtomicSpy.mockClear();
+				saveProjectSnapshot(cwd, changed);
+				expect(
+					writeFileAtomicSpy.mock.calls.filter(
+						([filePath]) => filePath === getProjectSnapshotPath(cwd),
+					),
+				).toHaveLength(1);
+				expect(readProjectSnapshotMeta(cwd)?.fingerprint).not.toBe(
+					priorFingerprint,
+				);
+			} finally {
+				writeFileAtomicSpy.mockImplementation(
+					realWriteFileAtomicHolder.current,
+				);
+			}
+		}));
+
+	it("seeds unchanged dedupe from persisted metadata after reset", () =>
+		withProjectDataDir((cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const snapshot = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, snapshot);
+
+			resetProjectSnapshotPersistWorkerForTests();
+			writeFileAtomicSpy.mockClear();
+			saveProjectSnapshot(cwd, {
+				...snapshot,
+				generatedAt: new Date(
+					Date.parse(snapshot.generatedAt) + 1000,
+				).toISOString(),
+			});
+
+			expect(
+				writeFileAtomicSpy.mock.calls.filter(
+					([filePath]) => filePath === getProjectSnapshotPath(cwd),
+				),
+			).toHaveLength(0);
+			expect(getProjectSnapshotPersistStateForTests(cwd)).toMatchObject({
+				active: false,
+				queued: false,
+			});
+		}));
+
 	it("bounds and idles authoritative snapshots", () =>
 		withProjectDataDir((cwd) => {
 			vi.useFakeTimers();
@@ -160,7 +399,11 @@ describe("project snapshot", () => {
 				reverseDeps: {},
 				cachedExports: [],
 			});
-			for (let i = 0; i < 9; i++) saveProjectSnapshot(path.join(cwd, `root-${i}`), makeSnapshot(path.join(cwd, `root-${i}`)));
+			for (let i = 0; i < 9; i++)
+				saveProjectSnapshot(
+					path.join(cwd, `root-${i}`),
+					makeSnapshot(path.join(cwd, `root-${i}`)),
+				);
 			const keys = _getAuthoritativeSnapshotCacheKeysForTests();
 			expect(keys).toHaveLength(8);
 			expect(keys[0]).toContain("root-1");
@@ -391,7 +634,9 @@ describe("project snapshot", () => {
 				generatedAt: "2026-01-01T00:00:00.000Z",
 				seq: 4,
 				files: { "a.ts": { path: "a.ts", mtimeMs: 1, size: 2, lastSeq: 1 } },
-				symbols: { "a.ts": [{ name: "f", kind: "function", filePath: "a.ts" }] },
+				symbols: {
+					"a.ts": [{ name: "f", kind: "function", filePath: "a.ts" }],
+				},
 				reverseDeps: { "a.ts": ["b.ts"] },
 				cachedExports: [["x", "/tmp/proj/x.ts"]],
 				wordIndex: { docs: ["huge", "postings", "graph"], df: { huge: 1 } },
@@ -768,7 +1013,9 @@ describe("project snapshot", () => {
 			saveRuntimeProjectSnapshot({ cwd, runtime });
 
 			const loaded = loadProjectSnapshot(cwd);
-			expect(loaded?.conventions?.frameworks.map((f) => f.id)).toEqual(["next"]);
+			expect(loaded?.conventions?.frameworks.map((f) => f.id)).toEqual([
+				"next",
+			]);
 		}));
 
 	it("hydrates cached exports and rules into a new runtime", () =>
@@ -796,7 +1043,10 @@ describe("project snapshot", () => {
 		withProjectDataDir((cwd) => {
 			const runtime = new RuntimeCoordinator();
 			runtime.seedProjectSequence(7);
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
 
 			const meta = readProjectSnapshotMeta(cwd);
 			expect(meta).toMatchObject({
@@ -884,7 +1134,10 @@ describe("project snapshot", () => {
 		withProjectDataDir((cwd) => {
 			const seed = new RuntimeCoordinator();
 			seed.seedProjectSequence(3);
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: seed }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: seed }),
+			);
 
 			// Simulate the process dying right after the meta write lands but
 			// before the body write does, by making only the body's
@@ -937,7 +1190,10 @@ describe("project snapshot", () => {
 			// meta directly for a NEWER seq than the body currently on disk.
 			const runtime = new RuntimeCoordinator();
 			runtime.seedProjectSequence(5);
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
 			expect(loadProjectSnapshot(cwd)?.seq).toBe(5);
 
 			fs.writeFileSync(
@@ -1057,7 +1313,10 @@ describe("project snapshot worker persist (#958)", () => {
 			const runtime = new RuntimeCoordinator();
 			runtime.seedProjectSequence(7);
 			runtime.cachedExports.set("makeThing", path.join(cwd, "src", "a.ts"));
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
 
 			const gzPath = getProjectSnapshotPath(cwd);
 			expect(await waitForFile(gzPath)).toBe(true);
@@ -1075,6 +1334,198 @@ describe("project snapshot worker persist (#958)", () => {
 			});
 		}));
 
+	it("keeps one active persist and only the latest queued candidate", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			const promotionSpy = vi.fn();
+			const suspension = suspendAt(promotionSpy, async () => {}, { calls: 1 });
+			try {
+				setProjectSnapshotPromotionSeamForTests(() => promotionSpy());
+				const runtime = new RuntimeCoordinator();
+				runtime.seedProjectSequence(7);
+				const first = buildProjectSnapshotFromRuntime({ cwd, runtime });
+				saveProjectSnapshot(cwd, first);
+				await suspension.admitted;
+
+				saveProjectSnapshot(cwd, {
+					...first,
+					cachedExports: [["middle", path.join(cwd, "middle.ts")]],
+				});
+				const latest: ProjectSnapshot = {
+					...first,
+					cachedExports: [["latest", path.join(cwd, "latest.ts")]],
+				};
+				saveProjectSnapshot(cwd, latest);
+				expect(getProjectSnapshotPersistStateForTests(cwd)).toMatchObject({
+					active: true,
+					queued: true,
+				});
+
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				await suspension.completed;
+				await waitForProjectSnapshotPersistsForTests();
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.cachedExports).toEqual(
+					latest.cachedExports,
+				);
+				expect(getProjectSnapshotPersistStateForTests(cwd)).toMatchObject({
+					active: false,
+					queued: false,
+				});
+			} finally {
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				suspension.restore();
+			}
+		}));
+
+	it("promotes one body for concurrent identical same-seq requests", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			const promotionSpy = vi.fn();
+			const suspension = suspendAt(promotionSpy, async () => {}, { calls: 1 });
+			try {
+				setProjectSnapshotPromotionSeamForTests(() => promotionSpy());
+				const runtime = new RuntimeCoordinator();
+				runtime.seedProjectSequence(7);
+				const snapshot = buildProjectSnapshotFromRuntime({ cwd, runtime });
+				saveProjectSnapshot(cwd, snapshot);
+				await suspension.admitted;
+				saveProjectSnapshot(cwd, {
+					...snapshot,
+					generatedAt: new Date(
+						Date.parse(snapshot.generatedAt) + 1000,
+					).toISOString(),
+				});
+
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				await suspension.completed;
+				await waitForProjectSnapshotPersistsForTests();
+				expect(getProjectSnapshotPersistStateForTests(cwd)).toMatchObject({
+					workerBodyWrites: 1,
+				});
+			} finally {
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				suspension.restore();
+			}
+		}));
+
+	it("rechecks sibling-process state at the unchanged decision seam", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const local = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, local);
+			await waitForProjectSnapshotPersistsForTests();
+
+			const promotionSpy = vi.fn();
+			const suspension = suspendAt(promotionSpy, async () => {}, { calls: 1 });
+			try {
+				setProjectSnapshotPromotionSeamForTests(() => promotionSpy());
+				saveProjectSnapshot(cwd, {
+					...local,
+					generatedAt: new Date(
+						Date.parse(local.generatedAt) + 1000,
+					).toISOString(),
+				});
+				await suspension.admitted;
+
+				const sibling: ProjectSnapshot = {
+					...local,
+					cachedExports: [
+						["lateSibling", path.join(cwd, "src", "late-sibling.ts")],
+					],
+					generatedAt: new Date(
+						Date.parse(local.generatedAt) + 2000,
+					).toISOString(),
+				};
+				const siblingJson = JSON.stringify(sibling);
+				const siblingFingerprint = fingerprintProjectSnapshotJson(
+					siblingJson,
+					sibling.generatedAt,
+				);
+				realWriteFileAtomicHolder.current(
+					getProjectSnapshotPath(cwd),
+					gzipSync(siblingJson),
+					{ bestEffort: false },
+				);
+				realWriteFileAtomicHolder.current(
+					getProjectSnapshotMetaPath(cwd),
+					JSON.stringify({
+						timestamp: sibling.generatedAt,
+						version: sibling.version,
+						seq: sibling.seq,
+						fingerprint: siblingFingerprint,
+					}),
+					{ bestEffort: false },
+				);
+
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				await suspension.completed;
+				await waitForProjectSnapshotPersistsForTests();
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.cachedExports).toEqual(
+					sibling.cachedExports,
+				);
+				expect(readProjectSnapshotMeta(cwd)?.fingerprint).toBe(
+					siblingFingerprint,
+				);
+			} finally {
+				setProjectSnapshotPromotionSeamForTests(undefined);
+				suspension.release();
+				suspension.restore();
+			}
+		}));
+
+	it("worker publication retries when fingerprint metadata fails", async () =>
+		withProjectDataDirAsync(async (cwd) => {
+			const runtime = new RuntimeCoordinator();
+			runtime.seedProjectSequence(7);
+			const first = buildProjectSnapshotFromRuntime({ cwd, runtime });
+			saveProjectSnapshot(cwd, first);
+			await waitForProjectSnapshotPersistsForTests();
+			const priorFingerprint = readProjectSnapshotMeta(cwd)?.fingerprint;
+			const changed: ProjectSnapshot = {
+				...first,
+				cachedExports: [
+					["workerChanged", path.join(cwd, "src", "worker-changed.ts")],
+				],
+			};
+			const metaPath = getProjectSnapshotMetaPath(cwd);
+			let failMetadata = true;
+			writeFileAtomicSpy.mockImplementation((targetPath, data, options) => {
+				if (targetPath === metaPath && failMetadata) {
+					failMetadata = false;
+					throw new Error("injected worker metadata failure");
+				}
+				return realWriteFileAtomicHolder.current(targetPath, data, options);
+			});
+			try {
+				saveProjectSnapshot(cwd, changed);
+				await waitForProjectSnapshotPersistsForTests();
+				const writesAfterFailure =
+					getProjectSnapshotPersistStateForTests(cwd).workerBodyWrites;
+				expect(readProjectSnapshotMeta(cwd)?.fingerprint).toBe(
+					priorFingerprint,
+				);
+
+				saveProjectSnapshot(cwd, changed);
+				await waitForProjectSnapshotPersistsForTests();
+				expect(
+					getProjectSnapshotPersistStateForTests(cwd).workerBodyWrites,
+				).toBe(writesAfterFailure + 1);
+				expect(readProjectSnapshotMeta(cwd)?.fingerprint).not.toBe(
+					priorFingerprint,
+				);
+			} finally {
+				writeFileAtomicSpy.mockImplementation(
+					realWriteFileAtomicHolder.current,
+				);
+			}
+		}));
+
 	it("a slow generation-N worker write does NOT clobber a newer generation-N+1 body", async () =>
 		withProjectDataDirAsync(async (cwd) => {
 			resetProjectSnapshotPersistWorkerForTests();
@@ -1084,7 +1535,10 @@ describe("project snapshot worker persist (#958)", () => {
 
 			const old = new RuntimeCoordinator();
 			old.seedProjectSequence(3);
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: old }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime: old }),
+			);
 
 			const fresh = new RuntimeCoordinator();
 			fresh.seedProjectSequence(4);
@@ -1099,8 +1553,8 @@ describe("project snapshot worker persist (#958)", () => {
 			await waitFor(
 				() =>
 					fs
-					.readdirSync(path.dirname(getProjectSnapshotPath(cwd)))
-					.filter((f) => f.includes(".stage-")),
+						.readdirSync(path.dirname(getProjectSnapshotPath(cwd)))
+						.filter((f) => f.includes(".stage-")),
 				(stageFiles) => stageFiles.length === 0,
 			);
 
@@ -1113,7 +1567,7 @@ describe("project snapshot worker persist (#958)", () => {
 			).toEqual([]);
 		}));
 
-	it("mutation proof: disabling the generation gate permits stale promotion", async () =>
+	it("mutation proof: disabling the generation gate permits a stale promotion", async () =>
 		withProjectDataDirAsync(async (cwd) => {
 			const promotionSpy = vi.fn();
 			const suspension = suspendAt(promotionSpy, async () => {}, { calls: 1 });
@@ -1125,18 +1579,18 @@ describe("project snapshot worker persist (#958)", () => {
 				fresh.seedProjectSequence(4);
 
 				setProjectSnapshotGenerationGateForTests(false);
-				saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: old }));
-				await suspension.admitted;
-				saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: fresh }));
-				// Let only later promotions pass while the old request remains held.
-				setProjectSnapshotPromotionSeamForTests(undefined);
-				await waitFor(
-					() => {
-						_resetProjectSnapshotParseCacheForTests();
-						return loadProjectSnapshot(cwd)?.seq;
-					},
-					(seq) => seq === 4,
+				saveProjectSnapshot(
+					cwd,
+					buildProjectSnapshotFromRuntime({ cwd, runtime: old }),
 				);
+				await suspension.admitted;
+				saveProjectSnapshot(
+					cwd,
+					buildProjectSnapshotFromRuntime({ cwd, runtime: fresh }),
+				);
+				// Delay the queued write so the stale promotion is observable on disk.
+				process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS = "1000";
+				setProjectSnapshotPromotionSeamForTests(undefined);
 				suspension.release();
 				await suspension.completed;
 				await waitFor(
@@ -1147,9 +1601,12 @@ describe("project snapshot worker persist (#958)", () => {
 					(seq) => seq === 3,
 				);
 				// Mutation RED: disabling the gate permits the superseded generation to
-				// win the final promotion.
+				// reach canonical storage, even though the serialized queue repairs it.
 				_resetProjectSnapshotParseCacheForTests();
 				expect(loadProjectSnapshot(cwd)?.seq).toBe(3);
+				await waitForProjectSnapshotPersistsForTests();
+				_resetProjectSnapshotParseCacheForTests();
+				expect(loadProjectSnapshot(cwd)?.seq).toBe(4);
 			} finally {
 				setProjectSnapshotPromotionSeamForTests(undefined);
 				suspension.release();
@@ -1162,20 +1619,24 @@ describe("project snapshot worker persist (#958)", () => {
 	it("the generation gate prevents stale promotion", async () =>
 		withProjectDataDirAsync(async (cwd) => {
 			const gatedPromotionSpy = vi.fn();
-			const gatedSuspension = suspendAt(
-				gatedPromotionSpy,
-				async () => {},
-				{ calls: 1 },
-			);
+			const gatedSuspension = suspendAt(gatedPromotionSpy, async () => {}, {
+				calls: 1,
+			});
 			try {
 				setProjectSnapshotPromotionSeamForTests(() => gatedPromotionSpy());
 				const gatedOld = new RuntimeCoordinator();
 				gatedOld.seedProjectSequence(5);
 				const gatedFresh = new RuntimeCoordinator();
 				gatedFresh.seedProjectSequence(6);
-				saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: gatedOld }));
+				saveProjectSnapshot(
+					cwd,
+					buildProjectSnapshotFromRuntime({ cwd, runtime: gatedOld }),
+				);
 				await gatedSuspension.admitted;
-				saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime: gatedFresh }));
+				saveProjectSnapshot(
+					cwd,
+					buildProjectSnapshotFromRuntime({ cwd, runtime: gatedFresh }),
+				);
 				setProjectSnapshotPromotionSeamForTests(undefined);
 				gatedSuspension.release();
 				await gatedSuspension.completed;
@@ -1211,7 +1672,9 @@ describe("project snapshot worker persist (#958)", () => {
 			fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
 			fs.writeFileSync(
 				legacyPath,
-				JSON.stringify(buildProjectSnapshotFromRuntime({ cwd, runtime: stale })),
+				JSON.stringify(
+					buildProjectSnapshotFromRuntime({ cwd, runtime: stale }),
+				),
 			);
 
 			// Hold the worker write in-flight so the fresh gz is not promoted yet.
@@ -1238,7 +1701,10 @@ describe("project snapshot worker persist (#958)", () => {
 			process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS = "1000";
 			const runtime = new RuntimeCoordinator();
 			runtime.seedProjectSequence(5);
-			saveProjectSnapshot(cwd, buildProjectSnapshotFromRuntime({ cwd, runtime }));
+			saveProjectSnapshot(
+				cwd,
+				buildProjectSnapshotFromRuntime({ cwd, runtime }),
+			);
 
 			// Kill the worker mid-write: the queued body must fall back to the
 			// synchronous main-thread writer, not silently vanish.

@@ -5,10 +5,15 @@ import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
+import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
+import { logLatency } from "./latency-logger.js";
+import { normalizeMapKey } from "./path-utils.js";
 import {
-	evaluateGitGuard,
-	isGitCommitOrPushAttempt,
-} from "./git-guard.js";
+	captureFileStats,
+	getOpaqueBaselineStore,
+	isGitWorktree,
+	type PendingOpaqueBaseline,
+} from "./opaque-mutation-scan.js";
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
@@ -51,7 +56,10 @@ import {
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { handleToolResult } from "./runtime-tool-result.js";
-import { isToolCallEventType, resolveToolCallCorrelationId } from "./tool-event.js";
+import {
+	isToolCallEventType,
+	resolveToolCallCorrelationId,
+} from "./tool-event.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
@@ -418,9 +426,7 @@ export async function handleToolCall(
 	}
 }
 
-async function handleToolCallImpl(
-	deps: ToolCallDeps,
-): Promise<ToolCallResult> {
+async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	const {
 		event,
 		ctx,
@@ -439,7 +445,8 @@ async function handleToolCallImpl(
 	let filePath: string | undefined;
 	const logToolReadGuardEvent = (
 		entry: Parameters<typeof logReadGuardEvent>[0],
-	): void => logReadGuardEvent({ ...entry, correlationId: readGuardCorrelationId });
+	): void =>
+		logReadGuardEvent({ ...entry, correlationId: readGuardCorrelationId });
 	const toolName = (event as { toolName?: string }).toolName ?? "";
 	const editInputForTelemetry = (event as { input?: unknown }).input as
 		| { edits?: unknown[] }
@@ -470,24 +477,76 @@ async function handleToolCallImpl(
 				: 1;
 	const logBlockedEditSummary = (source: string): void =>
 		logToolReadGuardEvent({
-				event: "edit_batch_summary",
-				filePath: filePath ?? "",
-				metadata: {
-					tool: toolName,
-					source,
-					editBatchSummary: createReadGuardEditBatchSummary({
-						requestedIndexes: requestedEditIndexes,
-						requestedTotal: requestedEditTotal,
-						rejectedReasons: requestedEditIndexes.map((index) => ({
-							index,
-							code: "preflight_blocked" as const,
-						})),
-						rejectedTotal: requestedEditTotal,
-						terminalStatus: "blocked",
-					}),
-				},
-			});
+			event: "edit_batch_summary",
+			filePath: filePath ?? "",
+			metadata: {
+				tool: toolName,
+				source,
+				editBatchSummary: createReadGuardEditBatchSummary({
+					requestedIndexes: requestedEditIndexes,
+					requestedTotal: requestedEditTotal,
+					rejectedReasons: requestedEditIndexes.map((index) => ({
+						index,
+						code: "preflight_blocked" as const,
+					})),
+					rejectedTotal: requestedEditTotal,
+					terminalStatus: "blocked",
+				}),
+			},
+		});
 	if (!lensEnabled) return;
+	// #2000 phase 2: opaque-command pre-snapshot. A bash command whose writes
+	// the extractor will not recognize gets a bounded stat snapshot of the
+	// project source universe BEFORE it runs; the tool_result side diffs it.
+	// Fire-and-forget capture is WRONG here (the child may finish first), but
+	// the capture is stat-only and budgeted, so awaiting it is bounded work on
+	// an already-second-scale bash path.
+	if (toolName === "bash") {
+		const commandInput = (event as { input?: { command?: unknown } }).input;
+		if (typeof commandInput?.command === "string" && commandInput.command) {
+			const scanRoot = ctx.cwd ?? runtime.projectRoot;
+			if (scanRoot) {
+				const started = Date.now();
+				const rootKey = `${normalizeMapKey(path.resolve(scanRoot))}:${runtime.sessionGeneration}`;
+				let baseline: PendingOpaqueBaseline;
+				let resultNote: string;
+				if (await isGitWorktree(scanRoot)) {
+					// Git-first: the timestamp IS the baseline; git answers what
+					// changed, at any repo size, with no file-universe cap.
+					baseline = { startedAt: started, strategy: "git" };
+					resultNote = "git";
+				} else {
+					const outcome = await captureFileStats(scanRoot, {
+						withHashes: true,
+					});
+					baseline = outcome.snapshot
+						? {
+								startedAt: started,
+								strategy: "stat-diff",
+								stats: outcome.snapshot,
+							}
+						: {
+								startedAt: started,
+								strategy: "stat-diff",
+								statsUnknownReason: outcome.unknownReason ?? "walk-failed",
+							};
+					resultNote =
+						outcome.unknownReason ?? `scanned:${outcome.scannedCount}`;
+				}
+				// Session-stamped key: a concurrent-secondary session (#473)
+				// replacing this slot must yield a no-pending-snapshot UNKNOWN
+				// for us - never a diff against another session's baseline.
+				getOpaqueBaselineStore().record(rootKey, baseline);
+				logLatency({
+					type: "phase",
+					phase: "opaque_mutation_prescan",
+					filePath: commandInput.command.slice(0, 80),
+					durationMs: Date.now() - started,
+					result: resultNote,
+				});
+			}
+		}
+	}
 	if (
 		getFlag("lens-guard") &&
 		isGitCommitOrPushAttempt(toolName, event.input)
@@ -546,7 +605,11 @@ async function handleToolCallImpl(
 	// `skipped` (the pre-fix-round-2 shape of this file) made EVERY new-file
 	// write's paired tool_result refuse to run diagnostics/autofix/format at
 	// all — a full pipeline regression worse than the bug #1642 fixes.
-	const targetIgnored = isPathIgnoredByProject(filePath, runtime.projectRoot, false);
+	const targetIgnored = isPathIgnoredByProject(
+		filePath,
+		runtime.projectRoot,
+		false,
+	);
 	if (attributesMutationTarget) {
 		// #1642: record the canonical target BY TOOL-CALL IDENTITY — including
 		// (especially) when it is being skipped here. The paired tool_result
@@ -662,7 +725,7 @@ async function handleToolCallImpl(
 						}
 					}
 					if (ctx.ui) {
-						ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+						updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 					}
 				})
 				.catch((err) => {
@@ -995,10 +1058,8 @@ async function handleToolCallImpl(
 					metadata: {
 						tool: "edit",
 						label: entry.label,
-						removedLineTrailingWhitespace:
-							patch.removedLineTrailingWhitespace,
-						removedTrailingEmptyLineCount:
-							patch.removedTrailingEmptyLineCount,
+						removedLineTrailingWhitespace: patch.removedLineTrailingWhitespace,
+						removedTrailingEmptyLineCount: patch.removedTrailingEmptyLineCount,
 						newTextTrailingEmptyLinesPatched: newTextPatched,
 					},
 				});
@@ -1165,9 +1226,9 @@ async function handleToolCallImpl(
 										toolName: "write",
 										input: { path: filePath },
 										details: {
-										piLensPartialApply: true,
-										readGuardCorrelationId,
-									},
+											piLensPartialApply: true,
+											readGuardCorrelationId,
+										},
 										content: [],
 										// #1655 item 2: `provider`/`model`/`sessionId`/`session`
 										// used to be forwarded here from the tool_call event.
@@ -1193,7 +1254,9 @@ async function handleToolCallImpl(
 										agentBehaviorClient.formatWarnings(warnings as any),
 								});
 								if (result?.isError) {
-									throw new Error("post-edit pipeline rejected synthetic partial apply");
+									throw new Error(
+										"post-edit pipeline rejected synthetic partial apply",
+									);
 								}
 								return result?.content
 									?.map((item) => item.text)

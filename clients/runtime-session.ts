@@ -41,6 +41,7 @@ import {
 } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
+import { resetCascadeTierSessionState } from "./lsp/cascade-tier.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
 import { resetWorkspaceDiagnosticsCacheSession } from "./lsp/workspace-diagnostics-session.js";
@@ -109,8 +110,10 @@ import { TrivyClient, type TrivyResult } from "./trivy-client.js";
 import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { logWordIndex } from "./word-index-logger.js";
+import { resetOpaqueMutationState } from "./opaque-mutation-scan.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
+import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -170,10 +173,7 @@ type StartupMode = "full" | "minimal" | "quick";
 
 const HOST_STALL_THRESHOLD_MS = 30_000;
 
-function logHostReadyDelay(
-	deps: SessionStartDeps,
-	cwd: string,
-): void {
+function logHostReadyDelay(deps: SessionStartDeps, cwd: string): void {
 	if (
 		!deps.emitHostReadyDelay ||
 		deps.sessionStartMonotonicAt === undefined ||
@@ -313,7 +313,10 @@ function recordSnapshotSequenceTimeout(args: {
  * late-arriving `wordIndex` for the interactive path.
  */
 function retroactivelyHydrateAfterDeferredSequence(args: {
-	getWarmupOwnSnapshotRead: () => ProjectSnapshotExportsAndRules | null | undefined;
+	getWarmupOwnSnapshotRead: () =>
+		| ProjectSnapshotExportsAndRules
+		| null
+		| undefined;
 	snapshotRoot: string;
 	runtime: RuntimeCoordinator;
 	dbg: (msg: string) => void;
@@ -396,9 +399,7 @@ function logProjectSnapshotProbe(args: {
 			`project_snapshot: loaded seq=${args.snapshot.seq} exports=${args.snapshot.cachedExports.length} files=${Object.keys(args.snapshot.files ?? {}).length} reverseDeps=${Object.keys(args.snapshot.reverseDeps ?? {}).length} startupScan=${Boolean(args.snapshot.startupScan)} languageProfile=${Boolean(args.snapshot.languageProfile)}`,
 		);
 	} else {
-		args.dbg(
-			`project_snapshot: miss reason=${args.missReason}`,
-		);
+		args.dbg(`project_snapshot: miss reason=${args.missReason}`);
 	}
 }
 
@@ -772,26 +773,29 @@ function scheduleManagedToolRefresh(dbg: SessionStartDeps["dbg"]): void {
 	const delayMs = Number(
 		process.env.PI_LENS_TOOL_REFRESH_DELAY_MS ?? MANAGED_TOOL_REFRESH_DELAY_MS,
 	);
-	const timer = setTimeout(() => {
-		void (async () => {
-			try {
-				const refresh = await import("./installer/managed-tool-refresh.js");
-				const outcome = await refresh.runManagedToolRefresh();
-				if (outcome.skipped) {
-					dbg(`session_start tool-refresh: skipped (${outcome.skipped})`);
-					return;
+	const timer = setTimeout(
+		() => {
+			void (async () => {
+				try {
+					const refresh = await import("./installer/managed-tool-refresh.js");
+					const outcome = await refresh.runManagedToolRefresh();
+					if (outcome.skipped) {
+						dbg(`session_start tool-refresh: skipped (${outcome.skipped})`);
+						return;
+					}
+					for (const result of outcome.refreshed) {
+						dbg(
+							`session_start tool-refresh: ${result.toolId} ${result.ok ? "ok" : "failed"}` +
+								`${result.changed ? ` ${result.previousVersion ?? "unknown"} → ${result.currentVersion}` : " (unchanged)"}`,
+						);
+					}
+				} catch (err) {
+					dbg(`session_start tool-refresh: error ${err}`);
 				}
-				for (const result of outcome.refreshed) {
-					dbg(
-						`session_start tool-refresh: ${result.toolId} ${result.ok ? "ok" : "failed"}` +
-							`${result.changed ? ` ${result.previousVersion ?? "unknown"} → ${result.currentVersion}` : " (unchanged)"}`,
-					);
-				}
-			} catch (err) {
-				dbg(`session_start tool-refresh: error ${err}`);
-			}
-		})();
-	}, Number.isFinite(delayMs) ? delayMs : MANAGED_TOOL_REFRESH_DELAY_MS);
+			})();
+		},
+		Number.isFinite(delayMs) ? delayMs : MANAGED_TOOL_REFRESH_DELAY_MS,
+	);
 	timer.unref?.();
 }
 
@@ -1024,9 +1028,8 @@ async function buildOrRefreshWordIndex(args: {
 	// implementation backs this task, the quick-mode warmup call below, AND the
 	// stateless cold-query background trigger in word-index.ts — a bound/skip
 	// -rule change lands once, not in three copies.
-	const { buildWordIndexAsync, collectWordIndexDocs } = await import(
-		"./word-index.js"
-	);
+	const { buildWordIndexAsync, collectWordIndexDocs } =
+		await import("./word-index.js");
 	const docs = await collectWordIndexDocs(
 		analysisRoot,
 		() => runtime.isCurrentSession(sessionGeneration),
@@ -1549,9 +1552,8 @@ function scheduleStartupScans(
 			extractSymbolsAndRefsFromGraph,
 			getReviewGraphCacheIdentity,
 		} = await import("./review-graph/builder.js");
-		const { buildCallGraph, saveCallGraph, loadCallGraph } = await import(
-			"./call-graph.js"
-		);
+		const { buildCallGraph, saveCallGraph, loadCallGraph } =
+			await import("./call-graph.js");
 		if (!runtime.isCurrentSession(sessionGeneration)) return;
 		const startMs = Date.now();
 		// Build (or hydrate) the canonical review graph first. The call graph is a
@@ -2106,6 +2108,10 @@ export async function handleSessionStart(
 	// previously session-lived with no reset hook at all).
 	resetWorkspaceTopology();
 	clearTsconfigPathsCache();
+	// #2000: opaque-recovery baselines are keyed cwd:generation (unreachable
+	// after reset) and the git-worktree memo must re-probe after a session
+	// that may have seen a non-git dir become one.
+	resetOpaqueMutationState();
 	// #817/#1199: Windows command resolution is cached per (command, canonical
 	// effective child PATH/PATHEXT/cwd/per-drive provenance); drop it each
 	// session so environment changes (e.g.
@@ -2119,6 +2125,11 @@ export async function handleSessionStart(
 	// the tool for the rest of the process lifetime. Clear it here, same
 	// boundary as the other per-session caches on this line.
 	resetDispatchAvailabilityState();
+	// #1995: a command that TIMED OUT (not merely failed a probe) cools down
+	// for the rest of the session so a hot loop of edits cannot hand the same
+	// wedged .cmd shim a second budget. A new session may retry: the executable
+	// or its environment may have changed.
+	resetSpawnTimeoutCooldowns();
 	// #1895: formatter PATH verdicts are session-scoped, but they live in
 	// formatters.ts and are not covered by the dispatch generation. Re-arm them
 	// here so a formatter installed or removed between sessions is observed by
@@ -2179,6 +2190,14 @@ export async function handleSessionStart(
 	// concrete KnipClient. Session reset is an optional lifecycle capability;
 	// its absence must not make session_start fail.
 	knipClient.resetSessionState?.();
+	// #1910: the tier-3 cascade outstanding-touch registry and its
+	// sweep-scoped expired/evicted counters (clients/lsp/cascade-tier.ts) are
+	// a per-SESSION claim about touches THIS session fired. #1899 bounded the
+	// registry between sweeps but, by its own review, left the session
+	// boundary unwired — a session replacement inherited the prior session's
+	// outstanding touches and misattributed a stray expiry/eviction to the
+	// next session's first reconcile gauge.
+	resetCascadeTierSessionState();
 	runtime.resetForSession(sessionStartMs);
 	logLatency({
 		type: "phase",
@@ -2369,6 +2388,38 @@ export async function handleSessionStart(
 		dbg(
 			"session_start: quick mode active - skipping slow tool probes, language profiling, preinstall, scans, and error debt baseline",
 		);
+		// #1911: the debug line above says WHICH steps were skipped, but nothing
+		// bounded or structured said so — quick mode's absence of work and an
+		// absent LOGGER read identically in latency.log. This record is that
+		// line's structured twin: one bounded gauge per quick-mode session_start,
+		// naming exactly the step set skipped, so a reader can tell "quick mode
+		// correctly skipped these" from "the probes silently never ran".
+		logLatency({
+			type: "phase",
+			phase: "session_start_skipped_steps",
+			filePath: cwd,
+			durationMs: 0,
+			metadata: {
+				mode: startupMode,
+				reason: deps.sessionReason,
+				// #1911 review F3: this `if (quickMode)` branch is an early return —
+				// the whole quick path — so there is no enumerable list of "steps
+				// run vs. skipped" this array could be derived from mechanically. It
+				// is DESCRIPTIVE documentation of what the early return skips,
+				// matching the `dbg()` line above word for word; keep both in sync by
+				// hand if either changes. It also does NOT narrow under
+				// `getFlag("no-lsp")` — quick mode skips the same five steps either
+				// way; the LSP flag instead affects `quickTools` above, a separate
+				// record.
+				steps: [
+					"slow_tool_probes",
+					"language_profiling",
+					"tool_preinstall",
+					"startup_scans",
+					"error_debt_baseline",
+				],
+			},
+		});
 		const totalDurationMs = Date.now() - sessionStartMs;
 		dbg(`session_start total: ${totalDurationMs}ms (interactive path)`);
 		logLatency({

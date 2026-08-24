@@ -689,16 +689,29 @@ const FORMATTER_POLICY_BY_EXTENSION = new Map<string, FormatterPolicy>([
 // imports and spreads this same Set (#1134; previously two parallel hand-maintained
 // lists, the #883 single-source-of-truth class).
 export const OXFMT_SUPPORTED_EXTENSIONS = new Set([
-	".js", ".jsx", ".mjs", ".cjs",
-	".ts", ".tsx", ".mts", ".cts",
+	".js",
+	".jsx",
+	".mjs",
+	".cjs",
+	".ts",
+	".tsx",
+	".mts",
+	".cts",
 	".vue",
 	".svelte",
-	".css", ".scss", ".less",
-	".html", ".htm",
-	".json", ".jsonc",
-	".yaml", ".yml",
-	".md", ".mdx",
-	".graphql", ".gql",
+	".css",
+	".scss",
+	".less",
+	".html",
+	".htm",
+	".json",
+	".jsonc",
+	".yaml",
+	".yml",
+	".md",
+	".mdx",
+	".graphql",
+	".gql",
 	".toml",
 ]);
 
@@ -728,7 +741,10 @@ FORMATTER_POLICY_BY_EXTENSION.set(".svelte", {
 });
 
 for (const [ext, policy] of FORMATTER_POLICY_BY_EXTENSION) {
-	if (OXFMT_SUPPORTED_EXTENSIONS.has(ext) && !policy.formatterNames.includes("oxfmt")) {
+	if (
+		OXFMT_SUPPORTED_EXTENSIONS.has(ext) &&
+		!policy.formatterNames.includes("oxfmt")
+	) {
 		policy.formatterNames.push("oxfmt");
 	}
 }
@@ -1923,7 +1939,7 @@ export function hasNearestPackageJsonDependency(
 		};
 		return Boolean(
 			pkg.dependencies?.[dependencyName] ??
-				pkg.devDependencies?.[dependencyName],
+			pkg.devDependencies?.[dependencyName],
 		);
 	} catch {}
 	return false;
@@ -2399,27 +2415,17 @@ export function biomeConfigArgs(cwd: string): string[] {
 	// the root config the way biome's own nested-config resolution allows. No
 	// flag at all lets biome discover it unaided, exactly like the ruff/
 	// markdownlint fallbacks above skip `--config` under the same condition.
+	if (getBiomeConfigPath(cwd)) return [];
+
+	// Otherwise route the resolved config through the precedence chain
+	// (project-scoped .pi, then global ~/.pi), falling back to the
+	// package-owned core.jsonc — the two-layer personal-config extension.
 	const resolved = resolveBiomeConfigPath(cwd);
-	if (!resolved) {
-		return [
-			"--config-path=" +
-				resolvePackagePath(import.meta.url, "config/biome/core.jsonc"),
-		];
-	}
-	// If the resolved config is a tracked project-internal biome.json(c), omit the flag
-	// so biome discovers it (and sub-package configs) unaided.
-	// If it's a project-scoped personal (.pi) or global (~/.pi) config, pass --config-path explicitly.
-	const projectConfigDir = findNearestMarkerRoot(cwd, BIOME_CONFIG_NAMES, {
-		boundaries: [".git"],
-	});
-	const isTrackedProjectConfig =
-		projectConfigDir &&
-		(resolved === path.join(projectConfigDir, "biome.jsonc") ||
-			resolved === path.join(projectConfigDir, "biome.json"));
-
-	if (isTrackedProjectConfig) return [];
-
-	return ["--config-path=" + resolved];
+	return [
+		"--config-path=" +
+			(resolved ??
+				resolvePackagePath(import.meta.url, "config/biome/core.jsonc")),
+	];
 }
 
 export function hasGolangciConfig(cwd: string): boolean {
@@ -2511,7 +2517,9 @@ const PSSCRIPTANALYZER_SETTINGS_FILES = [
  * through the stock `CodeFormatting` ruleset regardless of what it declared,
  * the same stock-style imposition #1144 banned for the other formatters.
  */
-export function findPSScriptAnalyzerConfigPath(cwd: string): string | undefined {
+export function findPSScriptAnalyzerConfigPath(
+	cwd: string,
+): string | undefined {
 	for (const dir of walkUpDirs(cwd)) {
 		for (const name of PSSCRIPTANALYZER_SETTINGS_FILES) {
 			const candidate = path.join(dir, name);
@@ -2553,7 +2561,9 @@ export function hasOrmoluConfig(cwd: string): boolean {
 }
 
 export function hasTaploConfig(cwd: string): boolean {
-	return findNearestContaining(cwd, ["taplo.toml", ".taplo.toml"]) !== undefined;
+	return (
+		findNearestContaining(cwd, ["taplo.toml", ".taplo.toml"]) !== undefined
+	);
 }
 
 // `terraform fmt` itself is deliberately unconfigurable (no rc file, no
@@ -2750,12 +2760,15 @@ export function getSpotlessKotlinFormatter(
 						fs.readFileSync(filePath, "utf-8"),
 					);
 					spotlessGradleReadCount += 1;
-					const kotlinBodies = namedGradleBlockBodies(source, "spotless").flatMap(
-						(spotless) => namedGradleBlockBodies(spotless, "kotlin"),
-					);
+					const kotlinBodies = namedGradleBlockBodies(
+						source,
+						"spotless",
+					).flatMap((spotless) => namedGradleBlockBodies(spotless, "kotlin"));
 					config = {
 						mtime,
-						ktlintConfig: kotlinBodies.some((body) => /\bktlint\s*\(/.test(body)),
+						ktlintConfig: kotlinBodies.some((body) =>
+							/\bktlint\s*\(/.test(body),
+						),
 						ktfmtConfig: kotlinBodies.some((body) => /\bktfmt\s*\(/.test(body)),
 					};
 					spotlessKotlinConfigCache.set(filePath, config);

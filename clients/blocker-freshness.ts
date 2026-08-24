@@ -226,7 +226,11 @@ async function resolveForwardImportsMemoized(
 	} catch {
 		imports = [];
 	}
-	importResolutionMemo.set(filePath, { mtimeMs: sig.mtimeMs, size: sig.size, imports });
+	importResolutionMemo.set(filePath, {
+		mtimeMs: sig.mtimeMs,
+		size: sig.size,
+		imports,
+	});
 	return imports;
 }
 
@@ -331,7 +335,11 @@ export async function collectForwardImportMtimes(
 	noteImportResolutionMemoTurn(turnIndex);
 	let imports: string[] = [];
 	try {
-		imports = await resolveForwardImportsMemoized(cwd, filePath, resolveForwardImports);
+		imports = await resolveForwardImportsMemoized(
+			cwd,
+			filePath,
+			resolveForwardImports,
+		);
 	} catch {
 		imports = [];
 	}
@@ -364,7 +372,10 @@ export async function collectForwardImportMtimes(
  * +50ms). +50ms comfortably clears the measured skew while staying far below the
  * gap between genuinely distinct edits.
  */
-export const MTIME_DRIFT_TOLERANCE_MS = 50;
+// Single implementation lives in the freshness kernel (#1739); this
+// re-export preserves every existing importer's path.
+export { MTIME_DRIFT_TOLERANCE_MS } from "./freshness.js";
+import { freshnessFromMtime } from "./freshness.js";
 
 interface DriftResult {
 	drifted: string[];
@@ -379,18 +390,23 @@ async function detectDrift(
 	turnIndex: number | undefined,
 ): Promise<DriftResult> {
 	const drifted: string[] = [];
-	const ownMtimeMs = await statMtimeMs(filePath);
-	if (ownMtimeMs !== undefined && ownMtimeMs > recordedAtMs + MTIME_DRIFT_TOLERANCE_MS) {
-		drifted.push(filePath);
-	}
+	const ownFreshness = freshnessFromMtime({
+		mtimeMs: await statMtimeMs(filePath),
+		referenceMs: recordedAtMs,
+	});
+	if (ownFreshness.verdict === "stale") drifted.push(filePath);
 	const { mtimes, truncated } = await collectForwardImportMtimes(
 		cwd,
 		filePath,
 		resolveForwardImports,
 		turnIndex,
 	);
-	for (const { path, mtimeMs } of mtimes) {
-		if (mtimeMs > recordedAtMs + MTIME_DRIFT_TOLERANCE_MS) drifted.push(path);
+	for (const { path: depPath, mtimeMs } of mtimes) {
+		const verdict = freshnessFromMtime({
+			mtimeMs,
+			referenceMs: recordedAtMs,
+		});
+		if (verdict.verdict === "stale") drifted.push(depPath);
 	}
 	return { drifted, truncated };
 }
@@ -506,7 +522,8 @@ export async function sweepInlineBlockerFreshness(
 		stale: entry.stale ?? false,
 		recordedAtMs: entry.recordedAtMs,
 		sources: entry.sources,
-		demote: () => runtime.markInlineBlockerStale(entry.filePath, "dependency-drift"),
+		demote: () =>
+			runtime.markInlineBlockerStale(entry.filePath, "dependency-drift"),
 	}));
 
 	// #1790 review F2: dedup key is `normalizeEphemeralMapKey`, not

@@ -8,6 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { gatedPromise, starveBudget } from "../support/fault-injection.js";
 
 vi.mock("../../clients/lsp/index.js", () => ({ getLSPService: vi.fn() }));
 
@@ -35,7 +36,7 @@ function mockService(
 }
 
 beforeEach(() => {
-	process.env.PI_LENS_LSP_SYNC_BUDGET_MS = "50";
+	starveBudget("PI_LENS_LSP_SYNC_BUDGET_MS", 50);
 	setAmbientAbortSignal(undefined);
 	logLatencyMock.mockClear();
 });
@@ -48,12 +49,16 @@ afterEach(() => {
 describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 	it("abandons a wedged touch after the budget instead of hanging", async () => {
 		// touchFile that never resolves = a server whose didChange write backpressures.
-		mockService(() => new Promise(() => {}));
+		// Kit-gated (#1838): the wedge is an explicit gatedPromise, so "the budget
+		// fired before the work completed" holds on any scheduler, any load.
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
 		const started = Date.now();
 		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
 		const elapsed = Date.now() - started;
 		expect(elapsed).toBeGreaterThanOrEqual(45);
 		expect(elapsed).toBeLessThan(2000); // returned, did not hang
+		gate.resolve(null); // release the gate so nothing dangles into teardown
 	});
 
 	it("returns immediately when the turn is already aborted, without touching", async () => {
@@ -101,7 +106,14 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 			() => new Promise(() => {}), // touch never resolves within the test
 			() => true, // the target server's spawn is still unresolved
 		);
-		await resyncLspFile("/proj/new.json", "content", true, false, getFlag, dbgSpy);
+		await resyncLspFile(
+			"/proj/new.json",
+			"content",
+			true,
+			false,
+			getFlag,
+			dbgSpy,
+		);
 
 		const joined = dbgCalls.join("\n");
 		expect(joined).toContain("spawn-in-flight");

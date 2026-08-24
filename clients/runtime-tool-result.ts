@@ -3,6 +3,13 @@ import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import { noteAuthoritativeContentAttachment } from "./agent-nudge.js";
 import {
+	captureFileStats,
+	diffFileStats,
+	getOpaqueBaselineStore,
+	recoverOpaqueChangesViaGit,
+} from "./opaque-mutation-scan.js";
+import { normalizeMapKey } from "./path-utils.js";
+import {
 	extractReadPathsFromCommand,
 	extractDeletedPathsFromCommand,
 	extractGrepSearchReadsFromOutput,
@@ -19,7 +26,11 @@ import { publishFormatQueued } from "./format-events-publish.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import type { ReadGuard } from "./read-guard.js";
 import { getFormatService } from "./format-service.js";
-import { isExternalOrVendorFile, normalizeEphemeralMapKey, pathsEqual } from "./path-utils.js";
+import {
+	isExternalOrVendorFile,
+	normalizeEphemeralMapKey,
+	pathsEqual,
+} from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
@@ -41,7 +52,6 @@ import {
 	renderPostAutofixNotice,
 } from "./post-autofix-notice.js";
 import {
-	appendProjectChange,
 	type ProjectChangeRange,
 	type ProjectChangeSource,
 } from "./project-changes.js";
@@ -112,6 +122,8 @@ interface ToolResultDeps {
 	 * Do not pass from external callers.
 	 */
 	_bypassDebounce?: boolean;
+	/** #2000: overrides the change-log source for this synthetic dispatch. */
+	_mutationSourceOverride?: ProjectChangeSource;
 	/** Internal bounded provenance carried through debounce/coalescing. */
 	_telemetryParticipantIds?: string[];
 	_telemetryParticipantTotal?: number;
@@ -273,7 +285,8 @@ function scheduleDebounced(
 	if (existing) {
 		clearTimeout(existing.timer);
 		const incomingId =
-			deps._telemetryParticipantIds?.[0] ?? getReadGuardCorrelationId(deps.event);
+			deps._telemetryParticipantIds?.[0] ??
+			getReadGuardCorrelationId(deps.event);
 		const priorIds = existing.latestDeps._telemetryParticipantIds ?? [];
 		existing.latestDeps = {
 			...deps,
@@ -306,8 +319,9 @@ function scheduleDebounced(
 		resolveFn = res;
 		rejectFn = rej;
 	});
-	const initialParticipantIds =
-		deps._telemetryParticipantIds ?? [getReadGuardCorrelationId(deps.event)];
+	const initialParticipantIds = deps._telemetryParticipantIds ?? [
+		getReadGuardCorrelationId(deps.event),
+	];
 	const entry: DebouncedEntry = {
 		timer: setTimeout(() => {
 			debouncedPipelines.delete(filePath);
@@ -379,23 +393,17 @@ function recordProjectChange(args: {
 	changedRange?: ProjectChangeRange;
 	dbg: (msg: string) => void;
 }): void {
-	const bump = (args.runtime as Partial<RuntimeCoordinator>).bumpFileSeq;
-	if (!bump) return;
-	const { projectSeq, fileSeq } = bump.call(args.runtime, args.filePath);
-	try {
-		appendProjectChange(args.cwd, {
-			seq: projectSeq,
-			timestamp: new Date().toISOString(),
-			sessionId: args.runtime.telemetrySessionId,
-			turnIndex: args.runtime.turnIndex,
-			source: args.source,
-			filePath: path.resolve(args.filePath),
-			fileSeq,
-			changedRange: args.changedRange,
-		});
-	} catch (err) {
-		args.dbg(`project change log append failed for ${args.filePath}: ${err}`);
-	}
+	// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
+	// RuntimeCoordinator.recordProjectMutation; this wrapper only carries the
+	// legacy dbg shape.
+	(args.runtime as Partial<RuntimeCoordinator>).recordProjectMutation?.({
+		filePath: args.filePath,
+		source: args.source,
+		cwd: args.cwd,
+		changedRange: args.changedRange,
+		onAppendError: (err) =>
+			args.dbg(`project change log append failed for ${args.filePath}: ${err}`),
+	});
 }
 
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
@@ -447,7 +455,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	let resolutionBasis: string;
 	if (attribution) {
 		resolutionBasis = attribution.originCwd;
-	} else if (toolCallId !== undefined && rawFilePath && !path.isAbsolute(rawFilePath)) {
+	} else if (
+		toolCallId !== undefined &&
+		rawFilePath &&
+		!path.isAbsolute(rawFilePath)
+	) {
 		// A real correlation id existed (the host DOES support one) but no
 		// attribution was recorded under it — evicted, cleared because the
 		// call was blocked before it could execute, or simply never seen by
@@ -537,27 +549,135 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		typeof (event.input as { command?: unknown }).command === "string"
 	) {
 		const command = (event.input as { command: string }).command;
-		const written = extractWrittenPathsFromCommand(
-			command,
-			workspaceRoot,
-		).filter(
-			(wp) =>
-				event.isError !== true &&
-				!isExternalOrVendorFile(wp, workspaceRoot) &&
-				!isPathIgnoredByProject(wp, workspaceRoot, false),
-		);
+		const recognized = extractWrittenPathsFromCommand(command, workspaceRoot);
+		// The SURVIVING recognized set: what will actually dispatch. Failure
+		// atomicity (#2000 invariant 5) means opaque recovery must subtract
+		// THIS set, not raw recognized - otherwise a redirect target dropped
+		// by the isError filter would be subtracted from recovery AND
+		// excluded here, attributed nowhere.
+		const recognizedWritten =
+			event.isError !== true
+				? recognized.filter(
+						(wp) =>
+							!isExternalOrVendorFile(wp, workspaceRoot) &&
+							!isPathIgnoredByProject(wp, workspaceRoot, false),
+					)
+				: [];
+		// #2000 phase 2: when the extractor recognizes NOTHING, the command is
+		// opaque-candidate — recover its actual changed set by diffing the pre
+		// snapshot taken at tool_call. Partial writes that landed before a
+		// nonzero exit ARE attributed (the files changed and the agent authored
+		// them) — a deliberate divergence from the isError filter above, which
+		// exists for restore semantics where attribution would lie.
+		let opaquePaths: string[] = [];
+		// Recovery runs for EVERY bash command with a pending baseline - not
+		// only recognized-empty ones. A mixed command (`python x.py > out.ts`
+		// plus script-internal writes) previously skipped observation entirely
+		// with zero telemetry; git-first recovery is cheap enough (~60ms) to
+		// close that gap, subtracting already-recognized paths so nothing
+		// double-dispatches.
+		if (workspaceRoot && !getFlag("no-read-guard")) {
+			const scanRoot = workspaceRoot;
+			const started = Date.now();
+			const pending = getOpaqueBaselineStore().take(
+				`${normalizeMapKey(path.resolve(scanRoot))}:${runtime.sessionGeneration}`,
+			);
+			let unknownReason: string | undefined;
+			if (!pending && recognized.length > 0) {
+				// Partial coverage without observation: the explicit verdict
+				// invariant 1 demands (never silently imply no change).
+				unknownReason = "partial-recognition-no-baseline";
+			} else if (!pending) {
+				unknownReason = "no-pending-snapshot";
+			} else if (pending.strategy === "git") {
+				// Git-first: no universe cap - works on any repo size.
+				const recovery = await recoverOpaqueChangesViaGit(
+					scanRoot,
+					pending.startedAt,
+				);
+				if (recovery.verdict === "recovered") {
+					opaquePaths = recovery.paths.filter(
+						(p) =>
+							!isExternalOrVendorFile(p, scanRoot) &&
+							!isPathIgnoredByProject(p, scanRoot, false),
+					);
+				} else if (recovery.verdict === "unknown" && recognized.length > 0) {
+					// Git hiccup on a partially-recognized command: the
+					// remainder's coverage is unknown, never clean-by-default.
+					unknownReason = recovery.unknownReason;
+				}
+			} else if (pending.stats) {
+				const outcome = await captureFileStats(scanRoot, {
+					withHashes: true,
+				});
+				if (outcome.snapshot && !outcome.unknownReason) {
+					opaquePaths = diffFileStats(pending.stats, outcome.snapshot);
+				} else {
+					unknownReason =
+						outcome.unknownReason ??
+						pending.statsUnknownReason ??
+						"walk-failed";
+				}
+			} else {
+				unknownReason = pending.statsUnknownReason ?? "walk-failed";
+			}
+			if (opaquePaths.length > 0 && recognizedWritten.length > 0) {
+				const survivingKeys = new Set(
+					recognizedWritten.map((p) => normalizeMapKey(path.resolve(p))),
+				);
+				opaquePaths = opaquePaths.filter((p) => !survivingKeys.has(p));
+			}
+			if (unknownReason) {
+				logLatency({
+					type: "phase",
+					phase: "opaque_mutation_coverage_unknown",
+					filePath: command.slice(0, 80),
+					durationMs: Date.now() - started,
+					result: unknownReason,
+				});
+			}
+			if (opaquePaths.length > 0) {
+				logLatency({
+					type: "phase",
+					phase: "opaque_mutation_recovered",
+					filePath: opaquePaths.slice(0, 5).join(","),
+					durationMs: Date.now() - started,
+					result: `changed:${opaquePaths.length}`,
+				});
+			}
+		}
+		// wp iterates opaquePaths VERBATIM (already normalizeMapKey keys), so the
+		// set must hold those exact strings - no re-resolution.
+		const opaqueSet = new Set(opaquePaths);
+		const written = [...recognizedWritten, ...opaquePaths];
 		for (const wp of written) {
 			if (!getFlag("no-read-guard")) deps.readGuard?.recordWritten(wp);
-			const receipt = (runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt;
+			const receipt = (runtime as Partial<RuntimeCoordinator>)
+				.recordMutationToolReceipt;
 			const autofixMode = receipt
 				? receipt.call(runtime, wp, "write").autofixMode
 				: "immediate";
+			// Recovered opaque writes carry their own source so the change log
+			// distinguishes them from parsed writes (auditable in production).
+			const isOpaque = opaqueSet.has(wp);
+			// Failure atomicity: an opaque-recovered file VERIFIABLY exists on
+			// disk, so its synthetic event must not inherit isError - the main
+			// path early-returns on failed host results before attribution,
+			// which would silently drop exactly the partial writes invariant 5
+			// says to attribute.
+			const syntheticEvent = {
+				...event,
+				toolName: "write",
+				input: { path: wp },
+				isError: false,
+			};
 			const syntheticResult = await handleToolResult({
 				...deps,
-				event: { ...event, toolName: "write", input: { path: wp } },
+				event: syntheticEvent,
 				_bypassDebounce: true,
 				_autofixMode: autofixMode,
 				_attachmentBudget: syntheticAttachmentBudget,
+				_mutationSourceOverride: isOpaque ? "opaque-script" : undefined,
 			});
 			if (syntheticResult) {
 				// #1590: forward verbatim. The synthetic call already charged the
@@ -572,7 +692,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		if (event.isError !== true && !getFlag("no-read-guard")) {
 			for (const span of extractReadPathsFromCommand(command, workspaceRoot)) {
 				if (isExternalOrVendorFile(span.filePath, workspaceRoot)) continue;
-				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false)) continue;
+				if (isPathIgnoredByProject(span.filePath, workspaceRoot, false))
+					continue;
 				deps.readGuard?.recordRead({
 					filePath: span.filePath,
 					requestedOffset: span.offset,
@@ -717,9 +838,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
-	const receipt = (runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt;
+	const receipt = (runtime as Partial<RuntimeCoordinator>)
+		.recordMutationToolReceipt;
 	const autofixMode = deps._bypassDebounce
-		? (deps._autofixMode ?? (event.toolName === "edit" ? "deferred" : "immediate"))
+		? (deps._autofixMode ??
+			(event.toolName === "edit" ? "deferred" : "immediate"))
 		: receipt
 			? receipt.call(runtime, filePath, event.toolName).autofixMode
 			: event.toolName === "edit"
@@ -895,7 +1018,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		runtime,
 		cwd: turnStateCwd,
 		filePath,
-		source: sourceForToolName(event.toolName, event.details),
+		source:
+			deps._mutationSourceOverride ??
+			sourceForToolName(event.toolName, event.details),
 		changedRange: singleRange(modifiedRanges),
 		dbg,
 	});
@@ -941,8 +1066,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 			// The settle clock is live because the deferred cascade may reach its
 			// budget derivation before or after turn_end starts waiting.
-			turnEndCascadeSettleStart: () =>
-				runtime.getTurnEndCascadeSettleStart(),
+			turnEndCascadeSettleStart: () => runtime.getTurnEndCascadeSettleStart(),
 			// #348 phase 2: live reference so the deferred cascade can update the
 			// warm word index in place at the same seam as the graph rebuild.
 			// `runtime.wordIndex` is read fresh (not captured) via this closure-free
@@ -1103,11 +1227,21 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	}
 
 	let autofixNewlyQueued = false;
-	if (!result.isError && autofixMode === "deferred" && nodeFs.existsSync(filePath)) {
+	if (
+		!result.isError &&
+		autofixMode === "deferred" &&
+		nodeFs.existsSync(filePath)
+	) {
 		autofixNewlyQueued =
 			(runtime as Partial<RuntimeCoordinator>).deferMutation?.call(
-				runtime, filePath, dispatchCwd, event.toolName, turnStateCwd,
-				"autofix", deps.sessionId, resolutionBasis,
+				runtime,
+				filePath,
+				dispatchCwd,
+				event.toolName,
+				turnStateCwd,
+				"autofix",
+				deps.sessionId,
+				resolutionBasis,
 			) ?? false;
 		dbg(`tool_result: queued deferred autofix for ${filePath}`);
 	}
@@ -1150,7 +1284,13 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 	if (autofixNewlyQueued && !formatQueued) {
-		publishFormatQueued({ filePath, cwd: dispatchCwd, tool: event.toolName, kinds: ["autofix"], dbg });
+		publishFormatQueued({
+			filePath,
+			cwd: dispatchCwd,
+			tool: event.toolName,
+			kinds: ["autofix"],
+			dbg,
+		});
 	}
 
 	for (const changedFile of result.changedFiles ?? []) {

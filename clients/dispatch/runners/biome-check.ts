@@ -24,6 +24,7 @@ import type {
 } from "../types.js";
 
 import { resolveToolCommandWithInstallFallback } from "./utils/runner-helpers.js";
+import { finishParsedRun } from "./utils/tool-failure.js";
 
 interface BiomeDiagnostic {
 	severity: "error" | "warning" | "info" | "hint";
@@ -327,7 +328,10 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 				diagnostics: [
 					{
 						id: "biome:parse-error:1",
-						message: "Biome JSON parse failed: " + parsed.parseError + (preview ? " (output preview: " + preview + ")" : ""),
+						message:
+							"Biome JSON parse failed: " +
+							parsed.parseError +
+							(preview ? " (output preview: " + preview + ")" : ""),
 						filePath: ctx.filePath,
 						line: 1,
 						column: 1,
@@ -340,19 +344,12 @@ const biomeCheckJsonRunner: RunnerDefinition = {
 			};
 		}
 
-		const diagnostics = parsed.diagnostics;
-		let semantic: RunnerResult["semantic"] = "none";
-		if (diagnostics.some((d) => d.semantic === "blocking")) {
-			semantic = "blocking";
-		} else if (diagnostics.length > 0) {
-			semantic = "warning";
-		}
-
-		return {
-			status: semantic === "blocking" ? "failed" : "succeeded",
-			diagnostics,
-			semantic,
-		};
+		return finishParsedRun({
+			tool: "biome",
+			ctx,
+			result: checkResult,
+			diagnostics: parsed.diagnostics,
+		});
 	},
 };
 

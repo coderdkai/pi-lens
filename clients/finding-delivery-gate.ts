@@ -77,6 +77,28 @@
  * rendering convention every gated surface reuses — a store must not invent
  * its own "stale" wording.
  *
+ * #1944 completes the rule: demotion must change the BODY, not only the
+ * channel and the coordinate. A demoted body carries no STOP banner and no
+ * "must be fixed" imperative, and a cited line the file no longer has renders
+ * as `L<n> (line no longer exists)`. `clients/demoted-finding-render.ts`
+ * (`degradeDemotedFindingBody`) is the one implementation for surfaces that
+ * deliver a RENDERED BODY — the turn-end advisory tier. Per-row surfaces
+ * (`clients/widget-state.ts`, `tools/lens-diagnostics.ts`) have no body to
+ * degrade; they satisfy the same rule by dropping the authority marker
+ * alongside the coordinate.
+ *
+ * ── Retirement (#1944) ────────────────────────────────────────────────────
+ * Demote-not-drop assumes the agent CAN re-run to confirm. A past-EOF
+ * demotion breaks that assumption: the file shrank past the cited lines, so
+ * no re-run can ever speak to them, and the record re-served on every turn
+ * end for the life of the session. Such a record is delivered ONCE, degraded,
+ * then retired (`RuntimeCoordinator.retireDemotedPastEofBlocker`). The
+ * suppression is recorded in the degradation ledger under
+ * `demoted-finding-retired`, whose subject keeps the store and file, and the
+ * delivered payload says so in its own words — so an empty advisory section
+ * can only mean "nothing to say". Dependency-drift demotions keep in-bounds
+ * coordinates the agent can act on and are NOT retired.
+ *
  * ── Explicit lag labels (the non-gated escape hatch) ──────────────────────
  * A store that cannot afford the freshness/disposition stack — because it
  * has no cited per-file path to stat (a package-pinned finding like a trivy
@@ -189,7 +211,9 @@ export interface LabeledDeliverySurface extends DeliverySurfaceBase {
 	ageSource: string;
 }
 
-export type DeliverySurfaceEntry = GatedDeliverySurface | LabeledDeliverySurface;
+export type DeliverySurfaceEntry =
+	| GatedDeliverySurface
+	| LabeledDeliverySurface;
 
 /**
  * The enumeration (#1634 criterion 1): every surface that renders findings to
@@ -228,7 +252,9 @@ function gated(
 	description: string,
 	gates: string[],
 	evidence: string[],
-	extra: Partial<Pick<GatedDeliverySurface, "status" | "partialReason" | "evidenceMin">> = {},
+	extra: Partial<
+		Pick<GatedDeliverySurface, "status" | "partialReason" | "evidenceMin">
+	> = {},
 ): GatedDeliverySurface {
 	return { mode: "gated", file, description, gates, evidence, ...extra };
 }
@@ -242,7 +268,15 @@ function labeled(
 	evidence: string[] = [],
 	extra: Partial<Pick<LabeledDeliverySurface, "status" | "partialReason">> = {},
 ): LabeledDeliverySurface {
-	return { mode: "labeled", file, description, reason, ageSource, evidence, ...extra };
+	return {
+		mode: "labeled",
+		file,
+		description,
+		reason,
+		ageSource,
+		evidence,
+		...extra,
+	};
 }
 
 const RUNTIME_TURN_FILE = "clients/runtime-turn.ts";
@@ -391,7 +425,8 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 		[],
 		{
 			status: "partial",
-			partialReason: "Same cascade carry-over caveat as runtime-turn:cascade-blocker.",
+			partialReason:
+				"Same cascade carry-over caveat as runtime-turn:cascade-blocker.",
 		},
 	),
 	"runtime-turn:call-graph-advisory": labeled(
@@ -412,8 +447,16 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 	"lens-diagnostics:mode-full": gated(
 		LENS_DIAGNOSTICS_FILE,
 		"`lens_diagnostics mode=full` report.",
-		["applyDispositions", "applyRulePolicy", "reconcileProjectDiagnosticsSnapshot"],
-		["applyDispositions(", "applyRulePolicy(", "reconcileProjectDiagnosticsSnapshot("],
+		[
+			"applyDispositions",
+			"applyRulePolicy",
+			"reconcileProjectDiagnosticsSnapshot",
+		],
+		[
+			"applyDispositions(",
+			"applyRulePolicy(",
+			"reconcileProjectDiagnosticsSnapshot(",
+		],
 	),
 	"lens-diagnostics:mode-all": gated(
 		LENS_DIAGNOSTICS_FILE,
@@ -464,7 +507,10 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 	),
 };
 
-function assertPartialStatusHasReason(id: string, entry: DeliverySurfaceEntry): void {
+function assertPartialStatusHasReason(
+	id: string,
+	entry: DeliverySurfaceEntry,
+): void {
 	if (entry.status === "partial" && !entry.partialReason) {
 		throw new Error(
 			`finding-delivery-gate: surface "${id}" is status=partial but names no partialReason`,
@@ -472,7 +518,10 @@ function assertPartialStatusHasReason(id: string, entry: DeliverySurfaceEntry): 
 	}
 }
 
-function assertGatedShapeIsWellFormed(id: string, entry: GatedDeliverySurface): void {
+function assertGatedShapeIsWellFormed(
+	id: string,
+	entry: GatedDeliverySurface,
+): void {
 	if (!Array.isArray(entry.gates) || entry.gates.length === 0) {
 		throw new Error(
 			`finding-delivery-gate: surface "${id}" is mode=gated but names no gate`,
@@ -485,7 +534,10 @@ function assertGatedShapeIsWellFormed(id: string, entry: GatedDeliverySurface): 
 	}
 }
 
-function assertLabeledShapeIsWellFormed(id: string, entry: LabeledDeliverySurface): void {
+function assertLabeledShapeIsWellFormed(
+	id: string,
+	entry: LabeledDeliverySurface,
+): void {
 	if (!entry.reason || !entry.ageSource) {
 		throw new Error(
 			`finding-delivery-gate: surface "${id}" is mode=labeled but is missing reason/ageSource`,

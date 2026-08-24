@@ -2124,89 +2124,67 @@ export async function verifyToolBinary(
 	 */
 	timeoutMs = 10000,
 ): Promise<boolean> {
-	return new Promise((resolve) => {
-		const isWindows = installerPlatform() === "win32";
-		const hasKnownWindowsExt = /\.(cmd|exe|ps1)$/i.test(binPath);
+	// #2015: safeSpawnAsync instead of raw spawn. Raw spawn's timeout
+	// SIGTERMed only cmd.exe on Windows (.cmd shims run shell:true), orphaning
+	// the grandchild node process - which kept scanning, held handles against
+	// the cleanup rm, and turned one slow cold-start verify into an
+	// install/verify/reinstall loop (23 SIGTERMs observed in one day).
+	// lifetimeCoupled tree-kill prevents orphans; result.signal gives a typed
+	// kill-reason for transient classification.
+	const isWindows = installerPlatform() === "win32";
+	const hasKnownWindowsExt = /\.(cmd|exe|ps1)$/i.test(binPath);
 
-		// On Windows, resolve the best executable path:
-		// - extensionless → prefer .cmd (cmd.exe-safe)
-		// - .ps1 → prefer .cmd sibling to avoid PowerShell execution-policy hangs
-		// - .cmd / .exe → use as-is
-		let execPath =
-			isWindows && !hasKnownWindowsExt ? `${binPath}.cmd` : binPath;
-		let useShell = isWindows && /\.(cmd|bat)$/i.test(execPath);
+	// On Windows, resolve the best executable path:
+	// - extensionless → prefer .cmd (cmd.exe-safe)
+	// - .ps1 → prefer .cmd sibling to avoid PowerShell execution-policy hangs
+	// - .cmd / .exe → use as-is
+	let execPath = isWindows && !hasKnownWindowsExt ? `${binPath}.cmd` : binPath;
 
-		if (isWindows && /\.ps1$/i.test(execPath)) {
-			const cmdSibling = `${execPath.slice(0, -4)}.cmd`;
-			if (require("node:fs").existsSync(cmdSibling)) {
-				execPath = cmdSibling;
-				useShell = true;
-			} else {
-				// Fall back to running without shell — cmd.exe can't run .ps1
-				useShell = false;
-			}
+	if (isWindows && /\.ps1$/i.test(execPath)) {
+		const cmdSibling = `${execPath.slice(0, -4)}.cmd`;
+		if (require("node:fs").existsSync(cmdSibling)) {
+			execPath = cmdSibling;
 		}
+	}
+	const useShell = isWindows && /\.(cmd|bat)$/i.test(execPath);
+	// safe-spawn routes .cmd/.bat through its cmd.exe wrapper internally
+	// (shell:false always at the child boundary; the wrapper string is built
+	// there), so no shell option exists or is needed here.
+	void useShell;
 
-		// When shell:true (Windows .cmd), bake args into the command string to avoid DEP0190.
-		const spawnCmd = useShell ? `"${execPath}" --version` : execPath;
-		let proc: ReturnType<typeof spawn>;
-		try {
-			proc = spawn(spawnCmd, useShell ? [] : ["--version"], {
-				timeout: timeoutMs,
-				stdio: ["ignore", "pipe", "pipe"],
-				shell: useShell,
-			});
-		} catch (err) {
-			// SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
-			// bug class, #533) — best-effort verify, resolve rather than reject.
-			// The prober itself never ran, so this says nothing about the binary.
-			logSessionStart(
-				`auto-install verify: spawn threw for ${binPath} (${err instanceof Error ? err.message : String(err)})`,
-			);
-			onTransient?.();
-			resolve(false);
-			return;
+	try {
+		const result = await safeSpawnAsync(execPath, ["--version"], {
+			timeout: timeoutMs,
+		});
+		const output = `${result.stdout}\n${result.stderr}`;
+		if (result.status === 0 && !result.error) {
+			debugLog(`Verified: ${binPath} (version: ${result.stdout.trim()})`);
+			onVersionOutput?.(result.stdout);
+			return true;
 		}
-
-		let stdout = "";
-		let stderr = "";
-
-		proc.stdout?.on("data", (data) => (stdout += data));
-		proc.stderr?.on("data", (data) => (stderr += data));
-
-		proc.on("exit", (code, signal) => {
-			if (code === 0) {
-				debugLog(`Verified: ${binPath} (version: ${stdout.trim()})`);
-				onVersionOutput?.(stdout);
-				resolve(true);
-			} else if (isLspTransportRequiredError(`${stdout}\n${stderr}`)) {
-				// Valid stdio LSP server that rejects `--version` (#208) — the
-				// transport-required error proves the binary works.
-				debugLog(`Verified (stdio LSP, transport-required): ${binPath}`);
-				resolve(true);
-			} else {
-				// `code === null` (usually paired with a `signal`) means the
-				// spawn timeout fired and the process was killed before it could
-				// exit on its own — a stall, not a verdict from the binary.
-				if (code === null || signal) onTransient?.();
-				logSessionStart(
-					`auto-install verify: failed for ${binPath} (exit=${code}${signal ? `, signal=${signal}` : ""})`,
-				);
-				resolve(false);
-			}
-		});
-
-		proc.on("error", (err) => {
-			const errno = (err as NodeJS.ErrnoException).code;
-			if (errno === "EAGAIN" || errno === "EBUSY" || errno === "ETIMEDOUT") {
-				onTransient?.();
-			}
-			logSessionStart(
-				`auto-install verify: error for ${binPath}: ${err.message}`,
-			);
-			resolve(false);
-		});
-	});
+		if (isLspTransportRequiredError(output)) {
+			// Valid stdio LSP server that rejects `--version` (#208) — the
+			// transport-required error proves the binary works.
+			debugLog(`Verified (stdio LSP, transport-required): ${binPath}`);
+			return true;
+		}
+		// A kill (timeout fired) or spawn-boundary failure is a stall, not a
+		// verdict from the binary (#1569 transient semantics).
+		if (result.signal !== undefined || result.spawnFailure) onTransient?.();
+		logSessionStart(
+			`auto-install verify: failed for ${binPath} (kind=${result.signal ? `killed-signal=${result.signal}` : result.error ? "spawn-error" : "exit-nonzero"}${result.status !== null ? `, exit=${result.status}` : ""})`,
+		);
+		return false;
+	} catch (err) {
+		// Spawn-boundary throw (Windows `spawn UNKNOWN`/EINVAL, the pidusage
+		// bug class, #533) — best-effort verify, resolve rather than reject.
+		// The prober itself never ran, so this says nothing about the binary.
+		logSessionStart(
+			`auto-install verify: spawn threw for ${binPath} (${err instanceof Error ? err.message : String(err)})`,
+		);
+		onTransient?.();
+		return false;
+	}
 }
 
 export type ToolSource =
@@ -3617,7 +3595,10 @@ export async function acquireManagedInstallGate(
 		};
 	}
 	if (!assertInstallAllowed(context)) {
-		return { ok: false, reason: `project trust: ${projectTrustDenialReason()}` };
+		return {
+			ok: false,
+			reason: `project trust: ${projectTrustDenialReason()}`,
+		};
 	}
 	// Held for the whole strategy call, not just the final write — a refresh
 	// can race a concurrent `ensureTool` install of the SAME tool into the SAME
@@ -3673,7 +3654,9 @@ export async function refreshManagedTool(
 	// which would otherwise make the switch look non-exhaustive.
 	const strategy = tool.installStrategy;
 
-	const gate = await acquireManagedInstallGate(`managed tool refresh: ${toolId}`);
+	const gate = await acquireManagedInstallGate(
+		`managed tool refresh: ${toolId}`,
+	);
 	if (!gate.ok) {
 		return { ok: false, unchanged: true, declined: true, reason: gate.reason };
 	}
@@ -4267,7 +4250,9 @@ async function installArchiveTool(
 			logSessionStart(
 				`archive-install ${tool.id}: extraction failed: ${extracted.stderr} — keeping installed version`,
 			);
-			await fs.rm(tmpExtractDir, { recursive: true, force: true }).catch(() => {});
+			await fs
+				.rm(tmpExtractDir, { recursive: true, force: true })
+				.catch(() => {});
 			return undefined;
 		}
 
@@ -4285,7 +4270,9 @@ async function installArchiveTool(
 				logSessionStart(
 					`archive-install ${tool.id}: tree marker not found at ${tmpMarker} after extraction — keeping installed version`,
 				);
-				await fs.rm(tmpExtractDir, { recursive: true, force: true }).catch(() => {});
+				await fs
+					.rm(tmpExtractDir, { recursive: true, force: true })
+					.catch(() => {});
 				return undefined;
 			}
 			await swapExtractedDir(tool.id, tmpExtractDir, extractDir);
@@ -4309,7 +4296,9 @@ async function installArchiveTool(
 			logSessionStart(
 				`archive-install ${tool.id}: launcher not found at ${tmpResolvedInner} after extraction — keeping installed version`,
 			);
-			await fs.rm(tmpExtractDir, { recursive: true, force: true }).catch(() => {});
+			await fs
+				.rm(tmpExtractDir, { recursive: true, force: true })
+				.catch(() => {});
 			return undefined;
 		}
 		if (!isWindows) await fs.chmod(tmpResolvedInner, 0o750).catch(() => {});
@@ -4348,7 +4337,9 @@ async function installArchiveTool(
 		return shimPath;
 	} catch (err) {
 		await fs.rm(tmpArchive, { force: true }).catch(() => {});
-		await fs.rm(tmpExtractDir, { recursive: true, force: true }).catch(() => {});
+		await fs
+			.rm(tmpExtractDir, { recursive: true, force: true })
+			.catch(() => {});
 		logSessionStart(
 			`archive-install ${tool.id}: install failed: ${(err as Error).message} — keeping installed version`,
 		);
@@ -4461,8 +4452,12 @@ async function installNpmTool(
 		// postinstall scripts that complete asynchronously after npm exits 0.
 		debugLog(`Verifying ${binaryName}...`);
 		let isValid = false;
+		let lastAttemptTransient = false;
 		for (let attempt = 1; attempt <= 3; attempt++) {
-			isValid = await verifyToolBinary(binPath);
+			lastAttemptTransient = false;
+			isValid = await verifyToolBinary(binPath, undefined, () => {
+				lastAttemptTransient = true;
+			});
 			if (isValid) break;
 			if (attempt < 3) {
 				logSessionStart(
@@ -4470,6 +4465,20 @@ async function installNpmTool(
 				);
 				await new Promise((r) => setTimeout(r, 1000 * attempt));
 			}
+		}
+		if (!isValid && lastAttemptTransient) {
+			// #2015: a killed/spawn-failed prober is NOT a verdict about the
+			// binary (#1569 semantics). Cold-start verifies on fresh installs
+			// legitimately exceed the budget on Windows (Defender/OneDrive
+			// first-touch scanning of new node_modules). Deleting a possibly-
+			// healthy install here is what turned one slow verify into the
+			// reinstall loop - keep the installation; the next ensureTool
+			// re-probes the existing binary via discovery instead of
+			// reinstalling from scratch.
+			logSessionStart(
+				`auto-install ${packageName}: verification inconclusive (transient); keeping installation for re-probe`,
+			);
+			return undefined;
 		}
 		if (!isValid) {
 			logSessionStart(
@@ -4753,9 +4762,8 @@ async function finishInstallAttempt(
 		// (dependency-checker.js already imports this module dynamically for the
 		// same reason).
 		try {
-			const { resetMadgeManagedPathMemo } = await import(
-				"../dependency-checker.js"
-			);
+			const { resetMadgeManagedPathMemo } =
+				await import("../dependency-checker.js");
 			resetMadgeManagedPathMemo();
 		} catch (err) {
 			logSessionStart(

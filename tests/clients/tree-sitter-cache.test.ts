@@ -152,9 +152,13 @@ describe("TreeSitterClient query-cache Tier-2 bounds (#1389)", () => {
 		const previous = process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
 		process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP = "8";
 		try {
-			const { TreeSitterClient } = await import("../../clients/tree-sitter-client.js");
+			const { TreeSitterClient } =
+				await import("../../clients/tree-sitter-client.js");
 			const client = new TreeSitterClient() as any;
-			const values = Array.from({ length: 9 }, (_, i) => ({ query: { delete: vi.fn() }, i }));
+			const values = Array.from({ length: 9 }, (_, i) => ({
+				query: { delete: vi.fn() },
+				i,
+			}));
 			for (let i = 0; i < 8; i++) client.cacheQuery(`q${i}`, values[i]);
 			client.queryCache.get("q0");
 			client.queryCache.delete("q0");
@@ -166,7 +170,8 @@ describe("TreeSitterClient query-cache Tier-2 bounds (#1389)", () => {
 			expect(client.queryCache.has("q1")).toBe(true);
 			expect(values[1].query.delete).toHaveBeenCalledTimes(1);
 		} finally {
-			if (previous === undefined) delete process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
+			if (previous === undefined)
+				delete process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP;
 			else process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP = previous;
 		}
 	});
@@ -391,7 +396,10 @@ describe("TreeCache statistics (#675)", () => {
 		expect(cache.get("z.ts", "z", "typescript")).toBeNull(); // never seen: cold
 		expect(cache.get("a.ts", "a", "typescript")).toBeNull(); // evicted, same content: capacity
 
-		expect(cache.getStats()).toMatchObject({ coldMisses: 1, capacityMisses: 1 });
+		expect(cache.getStats()).toMatchObject({
+			coldMisses: 1,
+			capacityMisses: 1,
+		});
 	});
 });
 
@@ -495,7 +503,10 @@ describe("TreeCache capacity growth for scan working sets (#1715)", () => {
 		}
 
 		expect(hits).toBe(fileCount);
-		expect(cache.getStats()).toMatchObject({ capacityMisses: 0, coldMisses: 0 });
+		expect(cache.getStats()).toMatchObject({
+			capacityMisses: 0,
+			coldMisses: 0,
+		});
 	});
 
 	describe("deriveScanTreeCacheCapacity", () => {
@@ -510,7 +521,9 @@ describe("TreeCache capacity growth for scan working sets (#1715)", () => {
 
 		it("targets the file count when it fits under the ceiling", () => {
 			delete process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP;
-			expect(deriveScanTreeCacheCapacity(110, TREE_CACHE_DEFAULT_MAX_SIZE)).toBe(110);
+			expect(
+				deriveScanTreeCacheCapacity(110, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(110);
 		});
 
 		it("never targets below the interactive default, even for a tiny scan", () => {
@@ -534,7 +547,9 @@ describe("TreeCache capacity growth for scan working sets (#1715)", () => {
 
 		it("respects an operator's PI_LENS_TREE_SITTER_CACHE_SCAN_CAP override", () => {
 			process.env.PI_LENS_TREE_SITTER_CACHE_SCAN_CAP = "75";
-			expect(deriveScanTreeCacheCapacity(1000, TREE_CACHE_DEFAULT_MAX_SIZE)).toBe(75);
+			expect(
+				deriveScanTreeCacheCapacity(1000, TREE_CACHE_DEFAULT_MAX_SIZE),
+			).toBe(75);
 		});
 
 		it("ignores a malformed override and falls back to the hard ceiling", () => {
@@ -583,6 +598,70 @@ describe("TreeCache capacity growth for scan working sets (#1715)", () => {
 			expect(tree.delete).not.toHaveBeenCalled();
 		}
 	});
+
+	// #1935: growing the cache to fit a scan's working set trades a bigger
+	// entry-count ceiling for more resident memory — `treeCacheTotalBytes`
+	// (the source-byte sum `memory_sample` reports, `getStats().totalBytes`
+	// here) must stay a bounded number, not climb without limit as a project
+	// grows past the cache's capacity. `TREE_CACHE_SCAN_CAPACITY_CEILING`
+	// (500 entries) is the enforcement point: this test offers far more files
+	// than the ceiling and pins that resident bytes stay bounded by realistic
+	// per-file sizes, proving the entry-count cap also bounds bytes.
+	it("bounds treeCacheTotalBytes at the scan ceiling using realistic, varying per-file sizes (#1935)", () => {
+		const cache = new TreeCache(TREE_CACHE_DEFAULT_MAX_SIZE);
+		// Realistic per-file source sizes observed in production (#1935 review
+		// round): 12.4KB-36KB, not one repeated size. A uniform fixture makes
+		// the byte assertion arithmetically forced by the entry-count
+		// assertion (every entry contributes the same amount, so the total is
+		// just `size * perFileBytes` and can't fail independently) and
+		// understates the real worst case. Cycle through a deterministic,
+		// non-uniform spread so the resident-byte sum carries information the
+		// entry-count assertion above doesn't already give away.
+		const minFileBytes = 12_400;
+		const maxFileBytes = 36_000;
+		const span = maxFileBytes - minFileBytes;
+		const sizeFor = (i: number): number =>
+			minFileBytes + Math.floor((span * ((i * 37) % 101)) / 100);
+
+		// A project many times larger than the hard ceiling — e.g. a 1500-file
+		// monorepo — so the cache must evict, not just grow unboundedly.
+		const totalFilesOffered = TREE_CACHE_SCAN_CAPACITY_CEILING * 3;
+		cache.setMaxSize(
+			deriveScanTreeCacheCapacity(totalFilesOffered, cache.getMaxSize()),
+		);
+		expect(cache.getMaxSize()).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+
+		const sizesOffered: number[] = [];
+		for (let i = 0; i < totalFilesOffered; i++) {
+			const bytes = sizeFor(i);
+			sizesOffered.push(bytes);
+			cache.set(`f${i}.ts`, "x".repeat(bytes), "typescript", fakeTree());
+		}
+
+		const stats = cache.getStats();
+		expect(stats.size).toBe(TREE_CACHE_SCAN_CAPACITY_CEILING);
+
+		// Eviction here is pure FIFO (no `get()` re-insertions reorder
+		// recency), so the resident set is exactly the LAST `ceiling` entries
+		// offered. Sum their sizes independently of the varying-size fixture
+		// above: this fails on its own if eviction keeps the wrong entries,
+		// double-counts, or the cap is missing entirely.
+		const expectedResidentBytes = sizesOffered
+			.slice(-TREE_CACHE_SCAN_CAPACITY_CEILING)
+			.reduce((sum, bytes) => sum + bytes, 0);
+		expect(stats.totalBytes).toBe(expectedResidentBytes);
+
+		// Blast radius (#1935 review): `TreeCache` enforces NO per-entry byte
+		// cap — only the entry-count ceiling (`fileSize` is accounted, never
+		// limited). At these realistic per-file sizes the 500-entry ceiling
+		// means 6-18MB of resident source bytes worst case, not the ~1.8MB a
+		// uniform ~3.6KB fixture would have implied. State the range plainly
+		// rather than let the fixture understate it.
+		const worstCaseFloor = TREE_CACHE_SCAN_CAPACITY_CEILING * minFileBytes;
+		const worstCaseCeiling = TREE_CACHE_SCAN_CAPACITY_CEILING * maxFileBytes;
+		expect(stats.totalBytes).toBeGreaterThanOrEqual(worstCaseFloor);
+		expect(stats.totalBytes).toBeLessThanOrEqual(worstCaseCeiling);
+	});
 });
 
 // #1727/#1777: `createTreeCacheCounters` builds its result with
@@ -609,8 +688,7 @@ describe("tree cache counter keys cover the counter type (#1727)", () => {
 		// missing, so `tsc` fails with TS2322. Verified by mutation: dropping
 		// `ghostHistoryDrops` from TREE_CACHE_COUNTER_KEYS reds this line and
 		// leaves the vacuous form green.
-		const _noMissing: [MissingCounterKey] extends [never] ? true : never =
-			true;
+		const _noMissing: [MissingCounterKey] extends [never] ? true : never = true;
 		expect(_noMissing).toBe(true);
 	});
 

@@ -174,6 +174,29 @@ vi.mock("node:child_process", () => ({
 	spawnSync: mockSpawnSync,
 }));
 
+// #2015: verifyToolBinary probes (and installNpmTool's npm-install spawn)
+// route through `safeSpawnAsync`, so that seam is mocked here too and every
+// invocation is recorded into the same `spawnCalls` log. `--version` probes
+// resolve to the configurable `versionOutput` string so tests can simulate an
+// installed binary reporting a drifted or matching version; everything else
+// resolves success with no output, so the reinstall path exercised by the
+// drift tests doesn't need a real npm.
+vi.mock("../../../clients/safe-spawn.js", () => ({
+	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
+	safeSpawnAsync: async (command: string, args: string[]) => {
+		const cmd = String(command);
+		const argv = args ?? [];
+		spawnCalls.push({ cmd, args: argv });
+		if (argv.includes("--version") || cmd.includes("--version")) {
+			return versionOutput.value
+				? { stdout: versionOutput.value, stderr: "", status: 0 }
+				: { stdout: "", stderr: "cannot execute", status: 126 };
+		}
+		return { stdout: "", stderr: "", status: 0 };
+	},
+	resetSafeSpawnWindowsCommandCache: vi.fn(),
+}));
+
 // isCommandAvailable (the PATH-walk used to resolve a BARE checkCommand, e.g.
 // "madge") reads `node:fs`'s statSync directly — it never touches the
 // `node:fs/promises` mock above. Mirrors path-walk-memo.test.ts's pattern.
@@ -184,8 +207,8 @@ vi.mock("node:child_process", () => ({
 const mockStatSync = vi.hoisted(() => vi.fn());
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
-	mockStatSync.mockImplementation((...args: Parameters<typeof actual.statSync>) =>
-		actual.statSync(...args),
+	mockStatSync.mockImplementation(
+		(...args: Parameters<typeof actual.statSync>) => actual.statSync(...args),
 	);
 	return { ...actual, statSync: mockStatSync };
 });
@@ -248,7 +271,9 @@ const savedPiLensHome = process.env.PI_LENS_HOME;
 let restoreDisableToolInstall: () => void;
 
 beforeEach(() => {
-	restoreDisableToolInstall = withEnv({ PI_LENS_DISABLE_TOOL_INSTALL: undefined });
+	restoreDisableToolInstall = withEnv({
+		PI_LENS_DISABLE_TOOL_INSTALL: undefined,
+	});
 	delete process.env.PI_LENS_HOME;
 	vi.clearAllMocks();
 	spawnCalls.length = 0;
@@ -351,7 +376,9 @@ describe("version-pin drift detection (#589)", () => {
 		process.env.PATH = TEST_HOME;
 		const realStatSync = mockStatSync.getMockImplementation();
 		try {
-			mockStatSync.mockImplementation(() => ({ isFile: () => true, size: 1 }) as never);
+			mockStatSync.mockImplementation(
+				() => ({ isFile: () => true, size: 1 }) as never,
+			);
 
 			const first = await ensureTool("madge");
 			expect(first).toBe("madge");
@@ -372,7 +399,9 @@ describe("version-pin drift detection (#589)", () => {
 			// bare command's ENOENT).
 			const third = await ensureTool("madge");
 			expect(third).toBe("madge");
-			expect(mockStatSync.mock.calls.length).toBeGreaterThan(statCallsAfterFirst);
+			expect(mockStatSync.mock.calls.length).toBeGreaterThan(
+				statCallsAfterFirst,
+			);
 		} finally {
 			if (realStatSync) mockStatSync.mockImplementation(realStatSync);
 			if (savedPath === undefined) delete process.env.PATH;

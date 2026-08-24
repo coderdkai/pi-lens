@@ -86,11 +86,16 @@ function hasProjectJscpdConfig(cwd: string): boolean {
 	return false;
 }
 
-const jscpdAvailability = createAvailabilityChecker("jscpd", "", ["--version"], {
-	probeTimeout: 1500,
-	// One definition of the managed-shim fast path, shared with knip (#1476).
-	fastPath: () => findManagedNodeToolBinary("jscpd"),
-});
+const jscpdAvailability = createAvailabilityChecker(
+	"jscpd",
+	"",
+	["--version"],
+	{
+		probeTimeout: 1500,
+		// One definition of the managed-shim fast path, shared with knip (#1476).
+		fastPath: () => findManagedNodeToolBinary("jscpd"),
+	},
+);
 
 // --- Client ---
 
@@ -152,13 +157,16 @@ export class JscpdClient {
 						: "skip";
 				}
 				if (!entry.isFile()) return "skip";
-				if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
+				// #1974: extension gate before isIgnored — the regex test is cheap
+				// per-call; isIgnored recompiles minimatch patterns per ancestor dir
+				// and should only run for files that already look like source.
 				if (
 					/\.(ts|tsx|js|jsx|mjs|cjs|py|pyi|java|go|rs|rb|php|swift|kt|kts|dart|lua|scala|c|h|cpp|cc|cxx|hpp|hxx|cs|m|mm)$/.test(
 						entry.name,
 					)
 				) {
 					if (entry.name.endsWith(".d.ts")) return "skip";
+					if (ignoreMatcher.isIgnored(fullPath, false)) return "skip";
 					return "stop";
 				}
 				return "skip";
@@ -311,7 +319,12 @@ export class JscpdClient {
 					".",
 					...(hasConfig
 						? []
-						: ["--min-lines", String(minLines), "--min-tokens", String(minTokens)]),
+						: [
+								"--min-lines",
+								String(minLines),
+								"--min-tokens",
+								String(minTokens),
+							]),
 					"--reporters",
 					"json",
 					"--output",

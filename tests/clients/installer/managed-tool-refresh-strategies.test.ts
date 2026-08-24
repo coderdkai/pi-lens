@@ -54,19 +54,14 @@ const TEST_HOME = vi.hoisted(() => {
 	return dir;
 });
 
-const { spawnMock, sessionLogSpy, httpsGetMock, childSpawnMock, renameMock } =
-	vi.hoisted(() => ({
+const { spawnMock, sessionLogSpy, httpsGetMock, renameMock } = vi.hoisted(
+	() => ({
 		spawnMock: vi.fn(),
 		sessionLogSpy: vi.fn(),
 		httpsGetMock: vi.fn(),
-		childSpawnMock: vi.fn(),
 		renameMock: vi.fn(),
-	}));
-
-vi.mock("node:child_process", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("node:child_process")>();
-	return { ...actual, default: actual, spawn: childSpawnMock };
-});
+	}),
+);
 
 // Every method delegates to the REAL `node:fs/promises` except `rename`,
 // which defaults to the real implementation too but is reconfigurable per
@@ -76,8 +71,8 @@ vi.mock("node:child_process", async (importOriginal) => {
 // load time and keep the mock a controllable passthrough by default.
 vi.mock("node:fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs/promises")>();
-	renameMock.mockImplementation(
-		(...args: Parameters<typeof actual.rename>) => actual.rename(...args),
+	renameMock.mockImplementation((...args: Parameters<typeof actual.rename>) =>
+		actual.rename(...args),
 	);
 	const mocked = { ...actual, rename: renameMock };
 	return { ...mocked, default: mocked };
@@ -241,29 +236,6 @@ httpsGetMock.mockImplementation(
 	},
 );
 
-/**
- * `verifyToolBinary` runs the refreshed artifact through a bare
- * `child_process.spawn`, not `safeSpawnAsync`, so the post-refresh verification
- * needs its own stub. Default: the artifact runs and prints a version.
- */
-let verifyExitCode = 0;
-
-function installDefaultVerifySpawn(): void {
-	childSpawnMock.mockImplementation(() => {
-		const proc = new EventEmitter() as EventEmitter & {
-			stdout: EventEmitter;
-			stderr: EventEmitter;
-		};
-		proc.stdout = new EventEmitter();
-		proc.stderr = new EventEmitter();
-		queueMicrotask(() => {
-			proc.stdout.emit("data", "1.2.3");
-			proc.emit("exit", verifyExitCode, null);
-		});
-		return proc;
-	});
-}
-
 /** A `releases/latest` route for shfmt returning `tag`, plus its asset. */
 function routeGitHubRelease(
 	tag: string,
@@ -393,10 +365,7 @@ beforeEach(() => {
 	fs.rmSync(PROBE_CACHE_PATH, { force: true });
 	fs.mkdirSync(TOOLS_DIR, { recursive: true });
 	httpsRoutes = [];
-	verifyExitCode = 0;
 	httpsGetMock.mockClear();
-	childSpawnMock.mockReset();
-	installDefaultVerifySpawn();
 	spawnMock.mockReset();
 	sessionLogSpy.mockReset();
 	resetDegradationLedger();
@@ -724,7 +693,19 @@ describe("github strategy", () => {
 		});
 		routeGitHubRelease("v3.12.0", { etag: 'W/"new"' });
 		// The download succeeds, the asset is written, and the binary is broken.
-		verifyExitCode = 1;
+		// (#2015: the post-refresh verification runs through `safeSpawnAsync`,
+		// the same seam as every other spawn, so the broken-binary scenario
+		// overrides it directly: the refreshed artifact's --version probe exits
+		// nonzero while any other spawn keeps the beforeEach default.)
+		const baseSpawn = spawnMock.getMockImplementation();
+		spawnMock.mockImplementation(async (command: string, args: string[]) => {
+			if ((args ?? []).includes("--version")) {
+				return { stdout: "", stderr: "cannot execute", status: 126 };
+			}
+			return (
+				baseSpawn?.(command, args) ?? { stdout: "1.2.3", stderr: "", status: 0 }
+			);
+		});
 
 		const outcome = await runManagedToolRefresh(NOW);
 
@@ -1183,7 +1164,10 @@ describe("swapExtractedDir rollback", () => {
 describe("archive tree-bundle refresh updates the probe cache", () => {
 	it("records a fresh probe-cache entry after a successful tree-bundle reinstall", async () => {
 		const toolId = "powershell-editor-services";
-		const treeMarkerRel = ["PowerShellEditorServices", "Start-EditorServices.ps1"];
+		const treeMarkerRel = [
+			"PowerShellEditorServices",
+			"Start-EditorServices.ps1",
+		];
 		const extractDir = path.join(TOOLS_DIR, toolId);
 		const markerPath = path.join(extractDir, ...treeMarkerRel);
 		fs.mkdirSync(path.dirname(markerPath), { recursive: true });
@@ -1205,19 +1189,17 @@ describe("archive tree-bundle refresh updates the probe cache", () => {
 		// Simulate `tar` genuinely writing the tree marker into whatever `-C`
 		// target the code extracted into — decoupled from any tmp-dir naming
 		// convention, so this exercises the real extract → verify → swap path.
-		spawnMock.mockImplementation(
-			async (_command: string, args: string[]) => {
-				const cIndex = (args ?? []).indexOf("-C");
-				if (cIndex !== -1) {
-					const targetDir = args[cIndex + 1];
-					const written = path.join(TOOLS_DIR, targetDir, ...treeMarkerRel);
-					fs.mkdirSync(path.dirname(written), { recursive: true });
-					fs.writeFileSync(written, "# fresh bootstrap");
-					return { stdout: "", stderr: "", status: 0 };
-				}
-				return { stdout: "1.2.3", stderr: "", status: 0 };
-			},
-		);
+		spawnMock.mockImplementation(async (_command: string, args: string[]) => {
+			const cIndex = (args ?? []).indexOf("-C");
+			if (cIndex !== -1) {
+				const targetDir = args[cIndex + 1];
+				const written = path.join(TOOLS_DIR, targetDir, ...treeMarkerRel);
+				fs.mkdirSync(path.dirname(written), { recursive: true });
+				fs.writeFileSync(written, "# fresh bootstrap");
+				return { stdout: "", stderr: "", status: 0 };
+			}
+			return { stdout: "1.2.3", stderr: "", status: 0 };
+		});
 
 		const outcome = await runManagedToolRefresh(NOW);
 
@@ -1304,9 +1286,7 @@ describe("install kill-switch, trust gate, and install lock", () => {
 			resolutionId: "v3.7.0",
 		});
 		expect(
-			logRows().some(
-				(l) => l.includes("shfmt") && l.includes("declined"),
-			),
+			logRows().some((l) => l.includes("shfmt") && l.includes("declined")),
 		).toBe(true);
 	});
 
@@ -1326,7 +1306,7 @@ describe("install kill-switch, trust gate, and install lock", () => {
 		});
 	});
 
-	it("proceeds normally on a host with no trust surface (\"unknown\", the default)", async () => {
+	it('proceeds normally on a host with no trust surface ("unknown", the default)', async () => {
 		staleGithubShfmt();
 
 		const outcome = await runManagedToolRefresh(NOW);

@@ -175,25 +175,26 @@ const CASES: Case[] = [
 		content: "Some prose.\n",
 		extraFiles: { ".vale.ini": "StylesPath = styles\n" },
 		failure: { status: 1, stderr: "E100 [vale] runtime error" },
+		// #1933 review F1: real `vale --output JSON` is a flat map keyed by the
+		// linted path, not `{ Data: { Files: [...] } }` -- the shape this fixture
+		// used to hand-write, which happened to match the also-wrong parser and
+		// so never caught the bug (AGENTS.md defect shape 16 and shape 7:
+		// unverified tool-output claim baked into a fixture nobody checked
+		// against a real binary). `Span` replaces the nonexistent "Column"
+		// field, matching a captured real run (see tests/clients/dispatch/
+		// runners/vale.test.ts for the full fixture provenance).
 		findings: {
 			status: 1,
 			stdout: JSON.stringify({
-				Data: {
-					Files: [
-						{
-							Path: "doc.md",
-							Alerts: [
-								{
-									Line: 1,
-									Column: 1,
-									Severity: "warning",
-									Message: "Wordy",
-									Check: "Vale.Terms",
-								},
-							],
-						},
-					],
-				},
+				"doc.md": [
+					{
+						Line: 1,
+						Span: [1, 6],
+						Severity: "warning",
+						Message: "Wordy",
+						Check: "Vale.Terms",
+					},
+				],
 			}),
 		},
 	},
@@ -256,11 +257,16 @@ describe("exit-blind runners no longer report a clean file after a failed run", 
 				expect(result.status).toBe("skipped");
 				expect(result.diagnostics).toEqual([]);
 
-				const group = summary.getDegradationSummary().find(
-					(entry) => entry.kind === "runner-empty-result",
+				const group = summary
+					.getDegradationSummary()
+					.find((entry) => entry.kind === "runner-empty-result");
+				expect(
+					group,
+					"expected a runner-empty-result ledger row",
+				).toBeDefined();
+				const row = group?.latestReasons.find(
+					(e) => e.subject === testCase.tool,
 				);
-				expect(group, "expected a runner-empty-result ledger row").toBeDefined();
-				const row = group?.latestReasons.find((e) => e.subject === testCase.tool);
 				expect(row, `expected a ledger row for ${testCase.tool}`).toBeDefined();
 				expect(row?.reason).toContain(testCase.tool);
 				expect(row?.reason).toContain(String(testCase.failure.status));
@@ -328,10 +334,12 @@ describe("exit-blind runners no longer report a clean file after a failed run", 
 				);
 
 				expect(result.status).toBe("skipped");
-				const group = summary.getDegradationSummary().find(
-					(entry) => entry.kind === "runner-empty-result",
+				const group = summary
+					.getDegradationSummary()
+					.find((entry) => entry.kind === "runner-empty-result");
+				const row = group?.latestReasons.find(
+					(e) => e.subject === testCase.tool,
 				);
-				const row = group?.latestReasons.find((e) => e.subject === testCase.tool);
 				expect(row?.reason).toContain("SIGKILL");
 			} finally {
 				env.cleanup();
@@ -358,12 +366,12 @@ describe("exit-blind runners no longer report a clean file after a failed run", 
 			for (let i = 0; i < 25; i += 1) {
 				await runner.run(createCtx("yaml", filePath, env.tmpDir) as never);
 			}
-			const group = summary.getDegradationSummary().find(
-				(entry) => entry.kind === "runner-empty-result",
-			);
-			expect(group?.latestReasons.filter((e) => e.subject === "yamllint")).toHaveLength(
-				1,
-			);
+			const group = summary
+				.getDegradationSummary()
+				.find((entry) => entry.kind === "runner-empty-result");
+			expect(
+				group?.latestReasons.filter((e) => e.subject === "yamllint"),
+			).toHaveLength(1);
 			expect(group?.count).toBe(25);
 			expect(
 				group?.latestReasons.find((e) => e.subject === "yamllint")?.reason,

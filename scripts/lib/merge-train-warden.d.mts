@@ -4,7 +4,10 @@ export const REQUIRED_CHECKS: string[];
 export const PAGE_SIZE: number;
 export const MAX_PAGES: number;
 
-export type FetchFn = (url: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export type FetchFn = (
+	url: string,
+	init?: { method?: string; body?: string; headers?: Record<string, string> },
+) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 export interface WardenPr {
 	number: number;
@@ -12,6 +15,7 @@ export interface WardenPr {
 	headSha: string | undefined;
 	mergeStateStatus: string;
 	autoMergeEnabled: boolean;
+	isFork: boolean;
 	labels: Set<string>;
 	checksUnknown: boolean;
 	failingRequiredChecks: Array<{ name: string; url?: string }>;
@@ -38,7 +42,26 @@ export interface WardenResult {
 	errors: WardenError[];
 }
 
-export function fetchOpenPullRequests(fetcher: FetchFn, owner: string, name: string): Promise<{ prs: WardenPr[]; errors: string[] }>;
+export function fetchOpenPullRequests(
+	fetcher: FetchFn,
+	owner: string,
+	name: string,
+): Promise<{ prs: WardenPr[]; errors: string[] }>;
 export function decideActions(pr: WardenPr): WardenAction[];
-export function applyAction(fetcher: FetchFn, owner: string, repo: string, pr: WardenPr, action: WardenAction): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
-export function runWarden(options: { fetcher: FetchFn; owner: string; repo: string }): Promise<WardenResult[]>;
+export function classifyActionFailure(
+	action: WardenAction,
+	pr: WardenPr,
+	status: number,
+): { benign: boolean; outcome: string | null };
+export function applyAction(
+	fetcher: FetchFn,
+	owner: string,
+	repo: string,
+	pr: WardenPr,
+	action: WardenAction,
+): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export function runWarden(options: {
+	fetcher: FetchFn;
+	owner: string;
+	repo: string;
+}): Promise<WardenResult[]>;

@@ -31,6 +31,7 @@
  */
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { gatedPromise, starveBudget } from "../../support/fault-injection.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 
 const FIXTURE_ROOT = path.join(process.cwd(), "runtime-exit-breaker-fixture");
@@ -323,7 +324,7 @@ describe("LSPService circuit breaker — post-init runtime exits (#1127)", () =>
 		// stand-in) and confirms it neither trips runtimeExitCounts nor gets
 		// misread as a crash.
 		const originalBudget = process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS;
-		process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = "5";
+		starveBudget("PI_LENS_LSP_NOTIFY_BUDGET_MS");
 		try {
 			const { LSPService } = await import("../../../clients/lsp/index.js");
 			const service = new LSPService();
@@ -340,7 +341,7 @@ describe("LSPService circuit breaker — post-init runtime exits (#1127)", () =>
 			// Every notify.open write hangs forever — withDeadline's 5ms budget
 			// times it out on every touchFile call, driving the backpressure
 			// streak without needing to fake a stalled real process.
-			client.notify.open = vi.fn().mockReturnValue(new Promise(() => {}));
+			client.notify.open = vi.fn().mockReturnValue(gatedPromise().promise);
 			createLSPClient.mockResolvedValue(client);
 
 			const file = FIXTURE_FILE;
@@ -470,7 +471,8 @@ describe("LSPService circuit breaker — windowed-rate trip (#1142)", () => {
 		expect(internal.runtimeExitCounts.get(key) ?? 0).toBe(0);
 		// Exactly TRIP_COUNT spawns happened before give-up.
 		expect(server.getSpawnCount()).toBe(TRIP_COUNT);
-		const { getDegradationSummary } = await import("../../../clients/degradation-ledger.js");
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
 		const summary = getDegradationSummary();
 		// The breaker records the trip exactly once, under this key. Filtered to
 		// the breaker kind rather than compared against the whole summary: #1743
@@ -548,7 +550,10 @@ describe("LSPService circuit breaker — windowed-rate trip (#1142)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 		const internal = service as unknown as {
-			state: { broken: Map<string, number>; clientSpawnedAt: Map<string, number> };
+			state: {
+				broken: Map<string, number>;
+				clientSpawnedAt: Map<string, number>;
+			};
 			runtimeExitWindow: Map<string, number[]>;
 			permanentlyBroken: Set<string>;
 		};
@@ -591,7 +596,10 @@ describe("LSPService circuit breaker — windowed-rate trip (#1142)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 		const internal = service as unknown as {
-			state: { broken: Map<string, number>; clientSpawnedAt: Map<string, number> };
+			state: {
+				broken: Map<string, number>;
+				clientSpawnedAt: Map<string, number>;
+			};
 			runtimeExitWindow: Map<string, number[]>;
 			permanentlyBroken: Set<string>;
 		};
@@ -683,7 +691,10 @@ describe("LSPService circuit breaker — windowed-rate trip (#1142)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 		const internal = service as unknown as {
-			state: { broken: Map<string, number>; clientSpawnedAt: Map<string, number> };
+			state: {
+				broken: Map<string, number>;
+				clientSpawnedAt: Map<string, number>;
+			};
 			runtimeExitWindow: Map<string, number[]>;
 			runtimeExitCounts: Map<string, number>;
 			permanentlyBroken: Set<string>;

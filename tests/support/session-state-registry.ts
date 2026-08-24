@@ -50,6 +50,12 @@ import {
 	isWorkspaceSweepActive,
 } from "../../clients/lsp/workspace-sweep-hold.js";
 import {
+	_getCascadeTierSweepCountersForTests,
+	_getOutstandingCascadeTouchesForTests,
+	recordOutstandingCascadeTouch,
+	resetCascadeTierSessionState,
+} from "../../clients/lsp/cascade-tier.js";
+import {
 	_resetDeferredForTests,
 	isDeferredThisSession,
 	markDisposition,
@@ -77,6 +83,15 @@ import {
 	workspaceDiagnosticsCacheSessionStart,
 } from "../../clients/lsp/workspace-diagnostics-session.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { clearFormatterCache } from "../../clients/formatters.js";
+import * as formattersModule from "../../clients/formatters.js";
+import { resetZizmorTokenAvailability } from "../../clients/zizmor-config.js";
+import * as zizmorConfigModule from "../../clients/zizmor-config.js";
+import {
+	isInSpawnTimeoutCooldown,
+	noteSpawnTimeout,
+	resetSpawnTimeoutCooldowns,
+} from "../../clients/spawn-timeout-cooldown.js";
 import {
 	consumeHostReadyDelayAnchor,
 	resetHostReadyDelayAnchorForTests,
@@ -164,6 +179,16 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			reset: () => resetBoundedTelemetry(),
 		},
 	},
+	// ── #2000 phase 2 opaque-recovery baselines ─────────────────────────
+	{
+		id: "opaque-mutation-scan:baselineStore+gitMemo",
+		module: "opaque-mutation-scan.ts",
+		state: "OpaqueBaselineStore byCwd map, gitRepoMemo",
+		policy: "session_start",
+		resetName: "resetOpaqueMutationState",
+		reason:
+			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation and become unreachable when the session generation advances; and the git-worktree memo must re-probe after a session that may have seen a directory become a worktree. Without the reset both leak per session and the memo mis-answers forever.",
+	},
 	// ── The named population from #1635 ──────────────────────────────────────
 	{
 		id: "degradation-ledger:onceKeys",
@@ -205,7 +230,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "runner-helpers:correctedAvailabilityByCwd",
 		module: "dispatch/runners/utils/runner-helpers.ts",
-		state: "correctedAvailabilityByCwd, installAttemptsByCwd, resolveInstallInFlightByCwd",
+		state:
+			"correctedAvailabilityByCwd, installAttemptsByCwd, resolveInstallInFlightByCwd",
 		policy: "session_start",
 		resetName: "resetDispatchAvailabilityState",
 		reason:
@@ -239,7 +265,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 					});
 				}
 			},
-			isArmed: () => probeLatch === undefined || !probeLatch.isInstallExhausted(),
+			isArmed: () =>
+				probeLatch === undefined || !probeLatch.isInstallExhausted(),
 			reset: () => resetInstallRetryLatches(),
 		},
 	},
@@ -267,8 +294,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "_resetDeferredForTests",
 		reason:
 			"A `defer` mark suppresses a diagnostic for THIS session by design; carrying it into the next session hides a finding nobody deferred.",
-		gap:
-			"Not wired: the only reset is the test-only seam, so a deferred diagnostic stays suppressed for the life of the PROCESS rather than the session. PR #1625 has now merged and did NOT close this (review round R1, S5): it scoped the Set's key per project and re-signed isDeferredThisSession, but added no session_start reset. The gap survives it and still needs an owner.",
+		gap: "Not wired: the only reset is the test-only seam, so a deferred diagnostic stays suppressed for the life of the PROCESS rather than the session. PR #1625 has now merged and did NOT close this (review round R1, S5): it scoped the Set's key per project and re-signed isDeferredThisSession, but added no session_start reset. The gap survives it and still needs an owner.",
 		probe: {
 			arm: () => {
 				const cwd = scratchCwd();
@@ -386,7 +412,22 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		policy: "session_start",
 		resetName: "resetZizmorTokenAvailability",
 		reason:
-			"#1535: a user who runs `gh auth login` between sessions must not read the previous session's `no token` verdict.",
+			"#1535: a user who runs `gh auth token` between sessions must not read the previous session's `no token` verdict.",
+		probe: {
+			arm: () => {
+				zizmorConfigModule
+					._getZizmorTokenLatchForTests()
+					.noteUnavailable("missing", "not-found");
+			},
+			isArmed: () => {
+				// A latched "missing" verdict reads false; a reset latch reads null
+				// (unknown — must re-probe). Clean means the verdict is forgotten.
+				return (
+					zizmorConfigModule._getZizmorTokenLatchForTests().read() === null
+				);
+			},
+			reset: () => resetZizmorTokenAvailability(),
+		},
 	},
 	{
 		id: "lazy-installer:attempts",
@@ -511,13 +552,110 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			"The service is torn down and rebuilt per session; this reset is also the seam that carries the sweep hold and TS-repair guard resets.",
 	},
 	{
+		id: "spawn-timeout-cooldown:latches",
+		module: "spawn-timeout-cooldown.ts",
+		state: "timedOutByCommand",
+		policy: "session_start",
+		resetName: "resetSpawnTimeoutCooldowns",
+		reason:
+			"#1995: a wedged command's post-timeout cooldown is session-scoped - a hot loop of edits must not hand the same .cmd shim a second budget, but a NEW session may retry because the executable or its environment may have changed.",
+		probe: {
+			arm: () => {
+				noteSpawnTimeout({
+					tool: "markdownlint",
+					command: "/pi-lens-probe-cmd",
+					phase: "lint",
+				});
+			},
+			isArmed: () => !isInSpawnTimeoutCooldown("/pi-lens-probe-cmd"),
+			reset: () => resetSpawnTimeoutCooldowns(),
+		},
+	},
+	{
 		id: "formatters:whichLatches",
 		module: "formatters.ts",
-		state: "whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs (cleared together with detectionCache)",
+		state:
+			"whichLatchByCommand, whichTransientCommands, cooldownRecordedForRetryAtMs (cleared together with detectionCache)",
 		policy: "session_start",
 		resetName: "clearFormatterCache",
 		reason:
 			"#1895: formatter PATH availability is session-scoped, but these module-local latches are not covered by the dispatch availability generation. A formatter installed or removed between sessions must be re-probed. The reset is `clearFormatterCache`, not the latch clear alone: `getFormattersForFile` answers a same-cwd lookup from `detectionCache` before it reaches a `which` probe, so dropping the latches without the selection cache re-arms every directory except the working one (review round on PR #1896).",
+		probe: {
+			// Arms all FOUR pieces of state the reset claims to cover — the three
+			// latch maps AND the selection cache. A probe that armed only the
+			// latches would stay green if a future cache were added and left out
+			// of `clearFormatterCache`; that omission is precisely the #1895 bug.
+			arm: () => {
+				const ns = getFormattersInternals();
+				ns.whichLatchByCommand.set("pi-lens-probe-cmd", {
+					latch: createAvailabilityLatch({ maxCooldownMs: 1_000 }),
+					resolved: null,
+				});
+				ns.whichTransientCommands.add("pi-lens-probe-transient");
+				ns.cooldownRecordedForRetryAtMs.set("pi-lens-probe-cmd", Date.now());
+				ns.detectionCache.set("/pi-lens-probe-cwd", {
+					signature: "session-state-registry-probe",
+					entries: new Map(),
+				});
+			},
+			isArmed: () => {
+				const ns = getFormattersInternals();
+				return (
+					ns.whichLatchByCommand.size === 0 &&
+					ns.whichTransientCommands.size === 0 &&
+					ns.cooldownRecordedForRetryAtMs.size === 0 &&
+					ns.detectionCache.size === 0
+				);
+			},
+			reset: () => clearFormatterCache(),
+		},
+	},
+	{
+		id: "cascade-tier:outstandingTouches",
+		module: "lsp/cascade-tier.ts",
+		state:
+			"_outstandingTouches, _expiredSinceLastSweep, _evictedSinceLastSweep",
+		policy: "session_start",
+		resetName: "resetCascadeTierSessionState",
+		reason:
+			"#1910: the tier-3 cascade outstanding-touch registry and its sweep-scoped expired/evicted counters are a per-SESSION claim about touches THIS session fired. #1899 bounded the registry between sweeps but, by its own review, left the session boundary unwired — a session replacement inherited the prior session's outstanding touches, and a stray eviction/expiry landing between a sweep and the boundary attributed its count to the next session's first reconcile gauge. Previously the whole file was blanket-exempted (#1909 review F4: 'cascade-tier registration and outstanding-touch bookkeeping'); this entry replaces that blanket claim with the real reset now that one exists. `_reconcileTaskRegistered` and the `_enabledCache` kill-switch memo are deliberately still NOT covered by a reset — the former is idempotent quiet-window-task registration (same shape as the other publisher-registration exemptions in this file), and the latter is a memo of the `PI_LENS_TIER_AWARE_CASCADE` env var, unaffected by a session boundary.",
+		probe: {
+			// Arms all THREE pieces of state the reset claims to cover, not just
+			// the map: an ancient touch trips the age prune (bumps `expired` on
+			// the next record), and CAP+1 fresh touches trip the size cap (bumps
+			// `evicted`). A probe that only checked the map would stay green if a
+			// future counter were added and left out of the reset — this one
+			// would not (review round, F2).
+			arm: () => {
+				const base = Date.now();
+				recordOutstandingCascadeTouch({
+					filePath: "/probe/session-state-registry-ancient.ts",
+					serverId: "session-state-registry-probe",
+					// Mirrors OUTSTANDING_TOUCH_MAX_AGE_MS in clients/lsp/cascade-tier.ts.
+					touchedAt: base - 15 * 60_000 - 1,
+				});
+				// Mirrors MAX_OUTSTANDING_TOUCHES in clients/lsp/cascade-tier.ts; the
+				// (CAP + 1)th record both prunes the ancient entry above and evicts
+				// the oldest surviving one.
+				const CAP = 256;
+				for (let i = 0; i <= CAP; i++) {
+					recordOutstandingCascadeTouch({
+						filePath: `/probe/session-state-registry-f${i}.ts`,
+						serverId: "session-state-registry-probe",
+						touchedAt: base - CAP + i,
+					});
+				}
+			},
+			isArmed: () => {
+				const counters = _getCascadeTierSweepCountersForTests();
+				return (
+					_getOutstandingCascadeTouchesForTests().length === 0 &&
+					counters.expired === 0 &&
+					counters.evicted === 0
+				);
+			},
+			reset: () => resetCascadeTierSessionState(),
+		},
 	},
 
 	// ── Deliberately not session_start ───────────────────────────────────────
@@ -564,6 +702,15 @@ let probeDeferredAnchor: string | undefined;
 let probeDeferredCwd: string | undefined;
 
 /**
+ * Module-private formatter state behind #1895's reset, exposed through the
+ * module's `_getFormatterResetStateForTests` hook — namespace casts cannot
+ * see non-exported bindings, so the hook is the only honest access.
+ */
+function getFormattersInternals() {
+	return formattersModule._getFormatterResetStateForTests();
+}
+
+/**
  * Read the defer set. `cwd` is part of the key since #1625: a weak anchor
  * encodes only a relative path, so the same anchor in two projects collided.
  */
@@ -597,16 +744,20 @@ export function _resetRegistryProbeState(): void {
 export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	// --- Host/toolchain derivations: the answer depends on the machine, not on
 	// the session. Re-deriving per session would just re-pay a spawn. ---
-	"lsp/jvm-runtime.ts": "resolved JVM location; a session boundary cannot move it",
+	"lsp/jvm-runtime.ts":
+		"resolved JVM location; a session boundary cannot move it",
 	"lsp/spawn-history.ts":
 		"successful spawn duration history intentionally spans session boundaries within the host process so later sessions can avoid waits that prior evidence proves cannot succeed",
 	"review-graph/git-identity.ts": "git user identity, read once per process",
 	"slow-fs.ts": "measured filesystem-latency classification of the host",
 	"tui-fit.ts": "terminal truncation-behavior probe",
-	"project-scale.ts": "project-scale base measurement, recomputed on its own inputs",
-	"sgconfig.ts": "bundled ast-grep rule snapshots and baselines, shipped with the extension",
+	"project-scale.ts":
+		"project-scale base measurement, recomputed on its own inputs",
+	"sgconfig.ts":
+		"bundled ast-grep rule snapshots and baselines, shipped with the extension",
 	"dispatch/runners/spotbugs.ts": "SpotBugs installation lookup, host-derived",
-	"generated-artifacts.ts": "generated-file classification derived from path patterns",
+	"generated-artifacts.ts":
+		"generated-file classification derived from path patterns",
 	"git-tracked-ignore.ts":
 		"git tracked/ignored sets, invalidated by their own mtime checks rather than by the session boundary",
 	"blocker-freshness.ts":
@@ -620,13 +771,16 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	// whose own loader owns invalidation. A stale value here is a config read,
 	// not a session verdict about a tool. ---
 	"runtime-config.ts": "env-derived runner timeout floor",
-	"subagent-mode.ts": "subagent-mode flag, fixed for the process by construction",
-	"lsp-budget.ts": "cross-process LSP budget decision, re-read on its own cadence",
+	"subagent-mode.ts":
+		"subagent-mode flag, fixed for the process by construction",
+	"lsp-budget.ts":
+		"cross-process LSP budget decision, re-read on its own cadence",
 	"lsp/config.ts": "LSP config in-flight dedupe, per-load not per-session",
 	"module-report-lsp.ts": "module-report LSP config memo",
 	"project-lens-config.ts":
 		"project .pi-lens config cache with its own mtime-based invalidation",
-	"lens-config.ts": "global config warn-once set, tied to the config file it warned about",
+	"lens-config.ts":
+		"global config warn-once set, tied to the config file it warned about",
 	"instance-registry.ts": "instance-registry enablement flag",
 	"session-lifecycle.ts":
 		"the session_start decision seam itself — it is the boundary, not state behind it",
@@ -637,7 +791,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"lens-events.ts": "lens event publisher registration",
 	"disposition-publish.ts": "disposition publisher registration",
 	"format-events-publish.ts": "format event publisher registration",
-	"diagnostics-publish.ts": "diagnostics publisher registration and dirty-path dedupe",
+	"diagnostics-publish.ts":
+		"diagnostics publisher registration and dirty-path dedupe",
 	"bus-events-logger.ts": "bus event rollup counters, an observability tally",
 	"ndjson-logger.ts": "registered log-file paths",
 	"latency-logger.ts":
@@ -645,31 +800,36 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"quiet-window.ts": "quiet-window task registration",
 	"quiet-window-config.ts":
 		"the env-derived quiet-window kill switch and wait budget, split out of quiet-window.ts by #1462; a memo of configuration, not of a session verdict",
-	"lsp/cascade-tier.ts": "cascade-tier registration and outstanding-touch bookkeeping",
 	"dispatch/lazy.ts": "the lazy dispatch-integration import cell",
 	"extension-log.ts": "console-method guard installation",
 	"cache-observability.ts":
-		"cache-prefix observation, already keyed by session id and cleared per session by its own caller",
+		"cache-prefix observation and per-session miss-attribution/summary state; both maps are role-separated when session identity is absent, bounded by the same LRU cap, summarized then cleared on each role-specific shutdown",
 
 	// --- Turn- or call-scoped working state: shorter-lived than a session, so
 	// a session_start reset would be redundant, not missing. ---
 	"agent-nudge.ts":
 		"the nudge accumulator deliberately spans runs by design (see its own doc comment)",
 	"git-guard.ts": "git-guard turn state, cleared on the turn path",
-	"runtime-tool-result.ts": "in-flight pipeline and last-analyzed memo, per file and per call",
-	"recent-touches.ts": "the recent-touch cursor, consumed and advanced per read",
-	"widget-state.ts": "widget render state, rebuilt from the sources it displays",
+	"runtime-tool-result.ts":
+		"in-flight pipeline and last-analyzed memo, per file and per call",
+	"recent-touches.ts":
+		"the recent-touch cursor, consumed and advanced per read",
+	"widget-state.ts":
+		"widget render state, rebuilt from the sources it displays",
 	"word-index.ts": "word-index build guard, per build",
-	"mcp/analyze.ts": "warm word-index cache keyed by path with its own freshness check",
+	"mcp/analyze.ts":
+		"warm word-index cache keyed by path with its own freshness check",
 	"mcp/session.ts":
 		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated",
 	"project-report.ts": "project-report build guard, per build",
 	"project-snapshot.ts":
-		"snapshot parse caches keyed by content, invalidated by the snapshot generation they were built from",
+		"snapshot parse caches and the bounded per-root persist coordinator are process-lifetime state keyed by content/generation; a session reset must not abandon an in-flight durable publication",
 	"review-graph/shared-extraction-ir.ts":
 		"extraction IR keyed by cwd and file, invalidated by the graph build that produced it",
-	"lsp/client.ts": "per-connection request bookkeeping, torn down with the connection",
-	"project-changes.ts": "change-log sequence fold counter, an observability tally",
+	"lsp/client.ts":
+		"per-connection request bookkeeping, torn down with the connection",
+	"project-changes.ts":
+		"change-log sequence fold counter, an observability tally",
 	"project-trust.ts":
 		"install-refusal warn-once set, tied to the trust decision rather than the session",
 	"lsp/workspace-diagnostics-cache.ts":
@@ -709,7 +869,8 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"bounded-telemetry.ts": 2,
 	"bus-events-logger.ts": 1,
 	"bus-publish.ts": 0,
-	"cache-observability.ts": 1,
+	// #1071 added the per-session miss-attribution ledger (1 → 2).
+	"cache-observability.ts": 2,
 	"degradation-ledger.ts": 3,
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
@@ -741,6 +902,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lsp/client.ts": 2,
 	"lsp/config.ts": 1,
 	"lsp/index.ts": 2,
+	// #2000 phase 2: the pending-baseline store (one slot per cwd:generation)
+	// plus the process-global Symbol.for slot; cleared via resetOpaqueMutationState.
+	"opaque-mutation-scan.ts": 1,
 	"lsp/jvm-runtime.ts": 0,
 	"lsp/spawn-history.ts": 1,
 	"lsp/server.ts": 5,
@@ -755,9 +919,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"project-lens-config.ts": 3,
 	"project-report.ts": 1,
 	"project-scale.ts": 0,
-	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests, the bounded digest hook
-	// (see clients/project-snapshot.ts:605-609's own comment anticipating this).
-	"project-snapshot.ts": 6,
+	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests. #1997: 6 -> 10 for
+	// bounded successful/failed and active/latest-queued persist state.
+	"project-snapshot.ts": 10,
 	"project-trust.ts": 1,
 	"quiet-window-config.ts": 0,
 	"quiet-window.ts": 0,

@@ -32,7 +32,12 @@ export interface LatencyEntry {
 	diagnosticCount?: number;
 	semantic?: string;
 	/** Per-diagnostic summary when a runner produces findings — aids root-cause analysis */
-	diagnostics?: Array<{ rule?: string; message: string; line?: number; semantic?: string }>;
+	diagnostics?: Array<{
+		rule?: string;
+		message: string;
+		line?: number;
+		semantic?: string;
+	}>;
 	/** For dispatch_complete: actual wall-clock time (groups run in parallel) */
 	wallClockMs?: number;
 	/** For dispatch_complete: sum of all individual runner durationMs */
@@ -108,6 +113,10 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * their own work. `lsp_scanner_coverage_gap` reports the touch's elapsed time for
  * joinability. Letting any of them win `lastPhase` would attribute a `loop_block`
  * to the record instead of to the touch that is actually stalled.
+ *
+ * #1996: `cache_usage_summary` is a zero-duration session rollup over earlier
+ * usage records. It reports no new work and therefore cannot own last-phase
+ * stall attribution.
  */
 const LAST_PHASE_EXCLUDED = new Set([
 	"loop_block",
@@ -117,6 +126,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"agent_end_deferred_mutation_drain",
 	"agent_end_deferred_mutation_requeue",
 	"session_end_bus_rollup",
+	"cache_usage_summary",
 	"lsp_aux_wait_outcome",
 	"tool_set_mutation",
 	"availability_decision",
@@ -136,7 +146,9 @@ const LAST_PHASE_EXCLUDED = new Set([
  * point at a prior turn's phase — compare `ts` against the block time before
  * trusting it as the cause (it is a breadcrumb, not proof).
  */
-export function getLastLoggedPhase(): { phase: string; ts: string } | undefined {
+export function getLastLoggedPhase():
+	| { phase: string; ts: string }
+	| undefined {
 	return recentPhases[0];
 }
 
@@ -174,7 +186,9 @@ export function _recentPhasesStorageLengthForTest(): number {
  * write-side guard (see `_recentPhasesStorageLengthForTest` above for why
  * that independence matters).
  */
-export function _setRecentPhasesForTest(entries: Array<{ phase: string; ts: string }>): void {
+export function _setRecentPhasesForTest(
+	entries: Array<{ phase: string; ts: string }>,
+): void {
 	recentPhases = entries;
 }
 
@@ -278,7 +292,11 @@ export function phaseStarted(phase: string): PhaseToken {
 export function phaseFinished(token: PhaseToken): void {
 	if (!liveBrackets.delete(token)) return;
 	closedBrackets = [
-		{ phase: token.phase, startedAt: token.startedAt, closedAt: new Date().toISOString() },
+		{
+			phase: token.phase,
+			startedAt: token.startedAt,
+			closedAt: new Date().toISOString(),
+		},
 		...closedBrackets,
 	].slice(0, CLOSED_BRACKET_CAP);
 }
@@ -485,7 +503,8 @@ export function getPhaseForWindow(
 		const startMs = Date.parse(startedAt);
 		const elapsedMs = endMs - startMs;
 		if (elapsedMs < minPlausibleElapsedMs) return; // N4: implausibly short to be the cause
-		const overlapMs = Math.min(endMs, windowEndMs) - Math.max(startMs, windowStartMs);
+		const overlapMs =
+			Math.min(endMs, windowEndMs) - Math.max(startMs, windowStartMs);
 		// #1723 review round 5, R1: divide by max(elapsedMs, windowLengthMs), not
 		// elapsedMs alone — see the function doc comment for why a bare
 		// elapsedMs denominator let a short bracket wholly INSIDE the window
@@ -499,7 +518,12 @@ export function getPhaseForWindow(
 		consider(token.phase, token.startedAt, nowMs, true);
 	}
 	for (const closed of closedBrackets) {
-		consider(closed.phase, closed.startedAt, Date.parse(closed.closedAt), false);
+		consider(
+			closed.phase,
+			closed.startedAt,
+			Date.parse(closed.closedAt),
+			false,
+		);
 	}
 	if (candidates.length === 0) return undefined;
 
@@ -534,8 +558,10 @@ export function getPhaseForWindow(
 	}
 	let best: FractionCandidate | undefined;
 	for (const candidate of candidates) {
-		if (Math.abs(candidate.fraction - maxFraction) > FRACTION_TIE_EPSILON) continue;
-		if (best === undefined || candidate.elapsedMs < best.elapsedMs) best = candidate;
+		if (Math.abs(candidate.fraction - maxFraction) > FRACTION_TIE_EPSILON)
+			continue;
+		if (best === undefined || candidate.elapsedMs < best.elapsedMs)
+			best = candidate;
 	}
 	if (best === undefined) return undefined;
 	return {
@@ -592,8 +618,15 @@ export function resetCurrentPhaseForSession(): void {
 
 export function logLatency(entry: LatencyEntry): void {
 	const ts = new Date().toISOString();
-	if (entry.type === "phase" && entry.phase && !LAST_PHASE_EXCLUDED.has(entry.phase)) {
-		recentPhases = [{ phase: entry.phase, ts }, ...recentPhases].slice(0, RECENT_PHASE_CAP);
+	if (
+		entry.type === "phase" &&
+		entry.phase &&
+		!LAST_PHASE_EXCLUDED.has(entry.phase)
+	) {
+		recentPhases = [{ phase: entry.phase, ts }, ...recentPhases].slice(
+			0,
+			RECENT_PHASE_CAP,
+		);
 	}
 	if (isTestMode()) {
 		return;

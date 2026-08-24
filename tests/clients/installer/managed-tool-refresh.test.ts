@@ -35,6 +35,7 @@ import {
 	vi,
 } from "vitest";
 import { exploreInterleavings } from "../../support/reset-explorer.js";
+import { fireResetAt } from "../../support/fault-injection.js";
 import { withEnv } from "../../support/with-env.js";
 
 vi.unmock("../../../clients/installer/index.js");
@@ -52,14 +53,31 @@ const TEST_HOME = vi.hoisted(() => {
 	return dir;
 });
 
-const { spawnMock, sessionLogSpy } = vi.hoisted(() => ({
+const { spawnMock, sessionLogSpy, shimExitCodes } = vi.hoisted(() => ({
 	spawnMock: vi.fn(),
 	sessionLogSpy: vi.fn(),
+	shimExitCodes: new Map<string, number>(),
 }));
 
 vi.mock("../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
-	safeSpawnAsync: spawnMock,
+	// #2015: verifyToolBinary probes route through safe-spawn too. Answer
+	// --version probes centrally from the fixture exit-code map; everything
+	// else delegates to the scenario-controlled spawnMock.
+	safeSpawnAsync: async (command: string, args: string[]) => {
+		if (args?.includes("--version")) {
+			const name = path
+				.basename(String(command))
+				.replace(/\.(cmd|exe|ps1)$/i, "");
+			const code = shimExitCodes.get(name) ?? 0;
+			return {
+				stdout: code === 0 ? "9.9.9\n" : "",
+				stderr: "",
+				status: code,
+			};
+		}
+		return spawnMock(command, args);
+	},
 	resetSafeSpawnWindowsCommandCache: vi.fn(),
 }));
 
@@ -112,10 +130,14 @@ const IS_WINDOWS = process.platform === "win32";
  * binary for real (through `node:child_process`, not the mocked safe-spawn
  * seam), so the post-update verification #1746 review F2 asks for can only be
  * exercised against something the OS can actually execute.
+ * (#2015: --version probes now route through the safe-spawn mock, which
+ * answers them from the hoisted shimExitCodes map above.)
  */
+
 function installBinShim(binaryName: string, exitCode = 0): void {
 	const binDir = path.join(NODE_MODULES, ".bin");
 	fs.mkdirSync(binDir, { recursive: true });
+	shimExitCodes.set(binaryName, exitCode);
 	if (IS_WINDOWS) {
 		fs.writeFileSync(
 			path.join(binDir, `${binaryName}.cmd`),
@@ -190,6 +212,17 @@ function stubSpawn(
 	bump?: Record<string, string>,
 ): void {
 	spawnMock.mockImplementation(async (_command: string, args: string[]) => {
+		if (args.includes("--version")) {
+			const name = path
+				.basename(String(_command))
+				.replace(/\.(cmd|exe|ps1)$/i, "");
+			const code = shimExitCodes.get(name) ?? 0;
+			return {
+				stdout: code === 0 ? "9.9.9" : "",
+				stderr: "",
+				status: code,
+			};
+		}
 		if (!args.includes("update") && !args.includes("upgrade")) {
 			// `where npm` / `which npm`
 			return { stdout: "npm", stderr: "", status: 0 };
@@ -224,6 +257,7 @@ let restoreDisableToolInstall: () => void;
 beforeEach(() => {
 	fs.rmSync(TOOLS_DIR, { recursive: true, force: true });
 	fs.mkdirSync(NODE_MODULES, { recursive: true });
+	shimExitCodes.clear();
 	spawnMock.mockReset();
 	sessionLogSpy.mockReset();
 	resetDegradationLedger();
@@ -522,6 +556,17 @@ describe("concurrent runs (review F1)", () => {
 			release = resolve;
 		});
 		spawnMock.mockImplementation(async (_command: string, args: string[]) => {
+			if (args.includes("--version")) {
+				const name = path
+					.basename(String(_command))
+					.replace(/\.(cmd|exe|ps1)$/i, "");
+				const code = shimExitCodes.get(name) ?? 0;
+				return {
+					stdout: code === 0 ? "9.9.9" : "",
+					stderr: "",
+					status: code,
+				};
+			}
 			if (!args.includes("update") && !args.includes("upgrade")) {
 				return { stdout: "npm", stderr: "", status: 0 };
 			}
@@ -598,10 +643,13 @@ describe("a session start mid-run does not extend the run (review R2-F1)", () =>
 				return { stdout: "npm", stderr: "", status: 0 };
 			}
 			sawUpdate += 1;
-			// A `/new` arrives while npm is still running. This is the ordinary
-			// case: the spawn budget is 120s and a session start costs nothing.
-			resetManagedToolRefreshSession();
 			return { stdout: "", stderr: "", status: 0 };
+		});
+		// A `/new` arrives while npm is still running (#1746 R2-F1): the reset
+		// fires INSIDE the update spawn via the fault-injection kit, before its
+		// result is consumed.
+		fireResetAt(spawnMock, resetManagedToolRefreshSession, {
+			when: (_c, args) => args.includes("update"),
 		});
 
 		await runManagedToolRefresh(NOW);
@@ -618,12 +666,20 @@ describe("a session start mid-run does not extend the run (review R2-F1)", () =>
 			if (!args.includes("update")) {
 				return { stdout: "npm", stderr: "", status: 0 };
 			}
-			// Three sessions start while this one update runs.
-			resetManagedToolRefreshSession();
-			resetManagedToolRefreshSession();
-			resetManagedToolRefreshSession();
 			return { stdout: "", stderr: "", status: 0 };
 		});
+		// Three sessions start while this one update runs — modeled as one
+		// mid-flight hook firing the reset three times back to-back, which is
+		// observationally identical for the budget under test.
+		fireResetAt(
+			spawnMock,
+			() => {
+				resetManagedToolRefreshSession();
+				resetManagedToolRefreshSession();
+				resetManagedToolRefreshSession();
+			},
+			{ when: (_c, args) => args.includes("update") },
+		);
 
 		await runManagedToolRefresh(NOW);
 
@@ -1029,7 +1085,10 @@ describe("install kill-switch, trust gate, and install lock", () => {
 		// No stamp write: the tool is retried plainly once the block lifts,
 		// rather than throttled by a 24h failure cooldown that has nothing to
 		// do with it.
-		expect(readState().knip).toEqual({ checkedAt: NOW - 8 * DAY_MS, version: "6.4.1" });
+		expect(readState().knip).toEqual({
+			checkedAt: NOW - 8 * DAY_MS,
+			version: "6.4.1",
+		});
 		expect(
 			logRows().some((row) => row.includes("knip") && row.includes("declined")),
 		).toBe(true);
