@@ -1047,28 +1047,82 @@ describe("Pipeline", () => {
 		// drive-letter class as #1139/#1150. A bare `path.resolve` equality does
 		// not fold that case difference, so it drops EVERY LSP blocker line and
 		// this record silently skips the past-EOF gate — fail-open, but exactly
-		// the pre-fix behavior on the surface #1641 targets. Guarded like this
-		// repo's other win32-casing probes (see `normalizeEphemeralMapKey`'s own
-		// tests in `path-utils.test.ts`) since CI's Unit tests job runs on
-		// ubuntu-latest and case-folding is a no-op there.
-		it("still captures lines when the blocker's path differs from ctx.filePath only by drive-letter case (win32)", async () => {
-			if (process.platform !== "win32") return;
-			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
-			const lowerDriveFilePath =
-				filePath.charAt(0).toLowerCase() + filePath.slice(1);
-			// The diagnostic's path is the OPPOSITE case from `ctx.filePath` —
-			// simulating an LSP-stamped realpath-canonical path colliding with a
-			// pipeline call site that received a lowercase-drive path.
-			const canonicalCaseFilePath =
-				filePath.charAt(0).toUpperCase() + filePath.slice(1);
+		// the pre-fix behavior on the surface #1641 targets. Declared skipped off
+		// Windows (#2089): CI's Unit tests job runs on ubuntu-latest, where
+		// case-folding is a no-op, and an early return there would report a PASS
+		// on a body that asserted nothing.
+		it.skipIf(process.platform !== "win32")(
+			"still captures lines when the blocker's path differs from ctx.filePath only by drive-letter case (win32)",
+			async () => {
+				const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+				const lowerDriveFilePath =
+					filePath.charAt(0).toLowerCase() + filePath.slice(1);
+				// The diagnostic's path is the OPPOSITE case from `ctx.filePath` —
+				// simulating an LSP-stamped realpath-canonical path colliding with a
+				// pipeline call site that received a lowercase-drive path.
+				const canonicalCaseFilePath =
+					filePath.charAt(0).toUpperCase() + filePath.slice(1);
+				vi.mocked(dispatchLintWithResult).mockResolvedValue({
+					diagnostics: [],
+					blockers: [
+						{
+							id: "lsp-1",
+							message: "Type error",
+							filePath: canonicalCaseFilePath,
+							line: 3,
+							severity: "error",
+							semantic: "blocking",
+							tool: "lsp",
+						},
+					],
+					warnings: [],
+					baselineWarningCount: 0,
+					fixed: [],
+					resolvedCount: 0,
+					output: "type error",
+					blockerOutput: "type error",
+					hasBlockers: true,
+				});
+
+				const result = await runPipeline(
+					createMockContext(lowerDriveFilePath),
+					createMockDeps(),
+				);
+
+				expect(result.inlineBlockerLines).toEqual([3]);
+			},
+		);
+	});
+
+	// #2028: the 🔴 STOP block is a registered agent-facing delivery surface
+	// (finding-delivery-gate.ts's `tool-call:stop-blocker`), so blockers whose
+	// cited file no longer exists are dropped before rendering — there is no
+	// remediation for content in a deleted file.
+	describe("#2028 stop-blocker deleted-path gate", () => {
+		it("drops blockers whose cited file was deleted from the rendered STOP block", async () => {
+			const filePath = createTempFile(
+				tmpDir,
+				"live.ts",
+				"const x = 1;\nconst y = 2;\n",
+			);
+			const deletedPath = path.join(tmpDir, "deleted-by-agent.ts");
 			vi.mocked(dispatchLintWithResult).mockResolvedValue({
 				diagnostics: [],
 				blockers: [
 					{
-						id: "lsp-1",
-						message: "Type error",
-						filePath: canonicalCaseFilePath,
-						line: 3,
+						id: "dead-1",
+						message: "DELETED-FILE-BLOCKER-MARKER secret in removed file",
+						filePath: deletedPath,
+						line: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "gitleaks",
+					},
+					{
+						id: "live-1",
+						message: "LIVE-FILE-BLOCKER-MARKER unused var",
+						filePath,
+						line: 1,
 						severity: "error",
 						semantic: "blocking",
 						tool: "lsp",
@@ -1078,17 +1132,62 @@ describe("Pipeline", () => {
 				baselineWarningCount: 0,
 				fixed: [],
 				resolvedCount: 0,
-				output: "type error",
-				blockerOutput: "type error",
+				output:
+					"DELETED-FILE-BLOCKER-MARKER secret in removed file\nLIVE-FILE-BLOCKER-MARKER unused var\ncoverage: ok",
+				blockerOutput:
+					"DELETED-FILE-BLOCKER-MARKER secret in removed file\nLIVE-FILE-BLOCKER-MARKER unused var\n",
 				hasBlockers: true,
 			});
 
 			const result = await runPipeline(
-				createMockContext(lowerDriveFilePath),
+				createMockContext(filePath),
 				createMockDeps(),
 			);
 
-			expect(result.inlineBlockerLines).toEqual([3]);
+			expect(result.hasBlockers).toBe(true);
+			// The live blocker renders at full authority…
+			expect(result.output).toContain("LIVE-FILE-BLOCKER-MARKER");
+			expect(result.output).toContain("🔴 STOP");
+			// …the deleted-file blocker does not render at all.
+			expect(result.output).not.toContain("DELETED-FILE-BLOCKER-MARKER");
+			// The surviving blocker's count is the LIVE one, not the raw total.
+			expect(result.output).toContain("1 issue(s)");
+		});
+
+		it("renders no STOP header when every blocker cites a deleted file", async () => {
+			const filePath = createTempFile(tmpDir, "clean-now.ts", "const x = 1;");
+			const deletedPath = path.join(tmpDir, "also-deleted.ts");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue({
+				diagnostics: [],
+				blockers: [
+					{
+						id: "dead-2",
+						message: "GHOST-BLOCKER-MARKER finding in removed file",
+						filePath: deletedPath,
+						line: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "gitleaks",
+					},
+				],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "GHOST-BLOCKER-MARKER finding in removed file",
+				blockerOutput: "GHOST-BLOCKER-MARKER finding in removed file",
+				hasBlockers: true,
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath),
+				createMockDeps(),
+			);
+
+			// No "🔴 STOP — 0 issue(s)" ghost header, and no replay of the raw
+			// blocker text either.
+			expect(result.output).not.toContain("🔴 STOP");
+			expect(result.output).not.toContain("GHOST-BLOCKER-MARKER");
 		});
 	});
 });

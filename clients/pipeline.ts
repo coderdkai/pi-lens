@@ -54,7 +54,6 @@ import {
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
 } from "./file-utils.js";
-import { isInSpawnTimeoutCooldown } from "./spawn-timeout-cooldown.js";
 import type { FormatService } from "./format-service.js";
 import { logLatency } from "./latency-logger.js";
 import type { PostAutofixNotice } from "./post-autofix-notice.js";
@@ -75,6 +74,7 @@ import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
 import { combineAbortSignals } from "./deadline-utils.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
 	getAutofixPolicyForFile,
 	getPreferredAutofixTools,
@@ -650,18 +650,12 @@ async function tryDetektFix(filePath: string, cwd: string): Promise<number> {
 	);
 }
 
-// Exported for #1995 cooldown wiring tests: the guard on this lane is
-// one of three mutation-proof surfaces.
 export async function tryMarkdownlintFix(
 	filePath: string,
 	cwd: string,
 ): Promise<number> {
 	const cmd = await resolveToolCommandWithInstallFallback(cwd, "markdownlint");
 	if (!cmd) return 0;
-	// #1995: skip the spawn entirely when the command is cooling down after a
-	// timeout — detectFileChangedAfterCommand also self-guards, but a wedged
-	// command should not even reach a second budget in the hot loop.
-	if (isInSpawnTimeoutCooldown(cmd)) return 0;
 	// Shared config-args seam (#1247): the lint runner consumes the same
 	// builder, so the bare --fix here can never fall back to markdownlint's
 	// default all-rules-on config again (the whole-file CHANGELOG/AGENTS
@@ -1267,9 +1261,11 @@ export async function runFormatPhase(
  */
 function buildEnrichedBlockerOutput(
 	blockers: Diagnostic[],
-	fileContent: string,
+	fileContent = "",
 ): string {
-	const fileLines = fileContent.split("\n");
+	// Empty fileContent (readback failed, e.g. deleted-file race) still
+	// renders the gated blocker list - just without per-line snippets.
+	const fileLines = fileContent ? fileContent.split("\n") : [];
 	const MAX_SNIPPET = 120; // chars — keep it tight in context
 
 	let out = `\n\n🔴 STOP — ${blockers.length} issue(s) must be fixed:\n`;
@@ -1532,10 +1528,27 @@ export async function runPipeline(
 		getDiagnosticTracker().trackAgentFixed(dispatchResult.resolvedCount);
 
 	let output = "";
+	// #2028: the 🔴 STOP block is an agent-facing delivery surface
+	// (finding-delivery-gate.ts's `tool-call:stop-blocker`), so it routes through
+	// the shared deleted-path gate before rendering: a blocker whose cited file
+	// no longer exists has no remediation the agent can perform (the finding IS
+	// the deleted file's content), so it is dropped here rather than re-asserted.
+	// One bounded stat per unique cited path, only when blockers exist — zero
+	// cost on the clean/fast paths.
+	const deliverableBlockers = dispatchResult.hasBlockers
+		? dropFindingsForMissingPaths({
+				store: "stop-blocker",
+				findings: dispatchResult.blockers,
+				cwd,
+				citedPath: (b) => b.filePath || undefined,
+			})
+		: dispatchResult.blockers;
 	if (dispatchResult.hasBlockers && fileContent) {
 		// Enrich blocker output with a code snippet so the agent can see the
 		// exact line it wrote that caused each violation — no re-read needed.
-		output += buildEnrichedBlockerOutput(dispatchResult.blockers, fileContent);
+		if (deliverableBlockers.length > 0) {
+			output += buildEnrichedBlockerOutput(deliverableBlockers, fileContent);
+		}
 		// Append fixed/coverage parts from the original output (slice off the
 		// blocker section we're replacing).
 		const rest = dispatchResult.output.slice(
@@ -1543,7 +1556,22 @@ export async function runPipeline(
 		);
 		if (rest) output += rest;
 	} else if (dispatchResult.output) {
-		output += `\n\n${dispatchResult.output}`;
+		// #2028 review P3: this path fires when readback FAILED - raw output
+		// still cites possibly-deleted files. Re-render from the gated set
+		// (no snippets without fileContent) and keep the post-blocker slice.
+		if (
+			dispatchResult.hasBlockers &&
+			deliverableBlockers.length !== dispatchResult.blockers.length
+		) {
+			let gatedOut = buildEnrichedBlockerOutput(deliverableBlockers);
+			const rest = dispatchResult.output.slice(
+				dispatchResult.blockerOutput.length,
+			);
+			if (rest) gatedOut += rest;
+			output += `\n\n${gatedOut}`;
+		} else {
+			output += `\n\n${dispatchResult.output}`;
+		}
 	}
 	if (fixedCount > 0) {
 		const detail =

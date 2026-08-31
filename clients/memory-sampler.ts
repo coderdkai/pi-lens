@@ -31,9 +31,14 @@
  */
 
 import type { WordIndex } from "./word-index.js";
+import {
+	countPostingEntries,
+	estimateWordIndexStoreBytes,
+} from "./word-index-store.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
 import { getReviewGraphWorkspaceCacheSnapshot } from "./review-graph/builder.js";
 import { getDispatchCascadeCacheStats } from "./dispatch/integration.js";
+import { getLspDocumentTextRetentionSnapshot } from "./lsp/client.js";
 
 /** Every N turns, emit one `memory_sample` latency.log line (#1123 item 2). */
 export const MEMORY_SAMPLE_TURN_INTERVAL = 10;
@@ -45,38 +50,136 @@ export function shouldEmitMemorySample(turnIndex: number): boolean {
 	return turnIndex > 0 && turnIndex % MEMORY_SAMPLE_TURN_INTERVAL === 0;
 }
 
+/**
+ * Rising-edge cadence (#1999): when heapUsed grows more than
+ * {@link HEAP_GROWTH_TIGHTEN_RATIO} between two sampled turns, sampling
+ * tightens from every {@link MEMORY_SAMPLE_TURN_INTERVAL} turns to every turn
+ * until growth stabilizes. The state below is module-scoped SESSION state —
+ * reset it at every primary `session_start` via
+ * {@link resetMemorySamplerCadence} (defect shape 17: a process-lifetime latch
+ * holding a session-scoped signal).
+ */
+export const HEAP_GROWTH_TIGHTEN_RATIO = 1.2;
+
+let _lastSampledHeapUsedBytes = 0;
+let _tightenThroughTurn = 0;
+
+/** Clear the rising-edge cadence state. Called on primary session_start. */
+export function resetMemorySamplerCadence(): void {
+	_lastSampledHeapUsedBytes = 0;
+	_tightenThroughTurn = 0;
+}
+
+/** PURE: >20% heap growth between two sampled readings warrants tightening. */
+export function isRapidHeapGrowth(
+	previousHeapUsedBytes: number,
+	currentHeapUsedBytes: number,
+): boolean {
+	return (
+		previousHeapUsedBytes > 0 &&
+		currentHeapUsedBytes > previousHeapUsedBytes * HEAP_GROWTH_TIGHTEN_RATIO
+	);
+}
+
+/** Record the heap reading of a sample just emitted at `turnIndex`. A rapid
+ *  growth edge extends the tightened window through the NEXT turn; each
+ *  subsequent still-growing sample (including one taken inside an already
+ *  tightened window) extends it again, so the window naturally expires once
+ *  growth stabilizes. Monotonic max so an out-of-order turn can never shrink
+ *  the window. O(1). */
+export function recordMemorySampleOutcome(
+	heapUsedBytes: number,
+	turnIndex: number,
+): void {
+	if (isRapidHeapGrowth(_lastSampledHeapUsedBytes, heapUsedBytes)) {
+		_tightenThroughTurn = Math.max(_tightenThroughTurn, turnIndex + 1);
+	}
+	_lastSampledHeapUsedBytes = heapUsedBytes;
+}
+
+/** Adaptive gate used by turn_end: base every-10 cadence OR an open tightened
+ *  window. Pure w.r.t. its argument; the window itself is session state owned
+ *  by {@link recordMemorySampleOutcome}. */
+export function shouldEmitMemorySampleAdaptive(turnIndex: number): boolean {
+	if (turnIndex <= 0) return false;
+	return (
+		turnIndex % MEMORY_SAMPLE_TURN_INTERVAL === 0 ||
+		turnIndex <= _tightenThroughTurn
+	);
+}
+
 export interface MemoryProcessUsage {
 	rssBytes: number;
 	heapUsedBytes: number;
 	heapTotalBytes: number;
 	externalBytes: number;
 	arrayBuffersBytes: number;
+	/** OS high-water mark (#1999): `process.resourceUsage().maxRSS` × 1024.
+	 *  On Windows libuv backs BOTH this and `rssBytes` with the same
+	 *  `GetProcessMemoryInfo()` call — rss reads `WorkingSetSize` (current),
+	 *  maxRSS reads `PeakWorkingSetSize` (high-water) — see libuv
+	 *  src/win/util.c `uv_resident_set_memory`. So `rss` IS the OS current
+	 *  working set at sample time (tasklist's "Mem Usage" column); there is no
+	 *  second live counter to cross-check it against, hence no separate OS call
+	 *  here. The #1999 "327MB sample vs 1767MB tasklist" gap is TEMPORAL, not
+	 *  counter divergence: the sampler fired at an idle/trimmed moment while
+	 *  tasklist observed a peak. `peakWorkingSetBytes` makes that distinguishable
+	 *  from logs alone: rss ≪ peak ⇒ samples are catching valleys, not missing
+	 *  growth. `null` when the reading is unavailable. */
+	peakWorkingSetBytes: number | null;
 }
 
-/** PURE: reshape Node's `process.memoryUsage()` into this module's field
- *  names — testable without touching the real process. */
+/** PURE: reshape Node's `process.memoryUsage()` (+ optional
+ *  `process.resourceUsage()`) into this module's field names — testable
+ *  without touching the real process. */
 export function toMemoryProcessUsage(
 	mem: NodeJS.MemoryUsage,
+	resourceUsage?: Partial<NodeJS.ResourceUsage>,
 ): MemoryProcessUsage {
+	const maxKb = resourceUsage?.maxRSS;
 	return {
 		rssBytes: mem.rss,
 		heapUsedBytes: mem.heapUsed,
 		heapTotalBytes: mem.heapTotal,
 		externalBytes: mem.external,
 		arrayBuffersBytes: mem.arrayBuffers,
+		peakWorkingSetBytes:
+			typeof maxKb === "number" && Number.isFinite(maxKb) && maxKb > 0
+				? maxKb * 1024
+				: null,
 	};
 }
 
 export interface MemorySampleSubsystems {
+	lsp: {
+		clients: number;
+		/** #2130: distinct project roots the live clients span. See
+		 *  `getLspDocumentTextRetentionSnapshot` for why a bare client count
+		 *  cannot be reconciled against `instances.json` without this. */
+		clientRoots: number;
+		incrementalTextEntries: number;
+		incrementalTextBytes: number;
+	};
 	reviewGraph: {
 		cacheEntries: number;
 		totalNodes: number;
 		totalEdges: number;
+		residentBytes: number;
 	};
 	/** `null` when no word index has been built yet this session. */
 	wordIndex: {
 		docs: number;
+		fileTable: number;
+		/** Distinct token count. Breadth, NOT memory — see `residentBytes`. */
 		postings: number;
+		/**
+		 * Total posting entries across every token (#2069). #1999 read
+		 * `postings` as this number and under-counted the subsystem by a factor
+		 * of sixty; both are reported now so the two can never be confused.
+		 */
+		postingEntries: number;
+		/** Estimated resident bytes of the index’s packed stores (#2069). */
+		residentBytes: number;
 		forwardEntries: number;
 	} | null;
 	/** `null` when the shared tree-sitter client hasn't been created yet
@@ -92,12 +195,39 @@ export interface MemorySampleSubsystems {
 	} | null;
 	dispatchCaches: {
 		recentlyCleanNeighborCacheSize: number;
+		/** Dispatch `FactStore`'s `sessionFacts` entry count — fixed vocabulary
+		 *  plus the bounded per-file map (#2282). */
+		sessionFactEntries: number;
+		/** Measured retained size of one `{ turnSeq, checkedAt }` cache entry. */
+		estimatedBytes: number;
 	};
+}
+
+/** Session-age ridealong (#1999): lets growth-vs-age curves be plotted from
+ *  latency.log alone. */
+export interface MemorySampleSessionContext {
+	sessionAgeMs: number;
+	sessionStartedAt: number;
+	turnCount: number;
+	/**
+	 * #2130: the project root this sample belongs to — the registered primary
+	 * session's root (`getActivePrimaryRoot`, `clients/session-lifecycle.ts`).
+	 *
+	 * `turnIndex` is per-runtime and restarts at 0 on every session reset, so a
+	 * multi-root host emitted `turnIndex: 10` twice with nothing to tell the two
+	 * apart. This field is that discriminator. `undefined` when no primary has
+	 * registered a root yet (an early sample, or a host that never ran
+	 * session_start) — never guessed from `process.cwd()`, which is what made
+	 * the pre-fix `sameCwd` field read `true` for every record.
+	 */
+	root?: string;
 }
 
 export interface MemorySample {
 	process: MemoryProcessUsage;
 	subsystems: MemorySampleSubsystems;
+	/** Present only when the caller supplies session context. */
+	session?: MemorySampleSessionContext;
 }
 
 /**
@@ -105,6 +235,19 @@ export interface MemorySample {
  * process-global singletons) but every individual read is a `.size`/`.length`
  * access — see the module docstring's hard constraint.
  */
+/** Byte attribution for `dispatchCaches`, from measured per-entry costs: three
+ *  isolated-store runs put a recently-clean neighbor entry at 320 bytes, and
+ *  #2282 measured a 500-file batch's 1,000 session-fact entries at 439,560
+ *  bytes (~440 each). O(1) — the cache key and Map bookkeeping are included. */
+export function estimateDispatchCacheBytes(stats: {
+	recentlyCleanNeighborCacheSize: number;
+	sessionFactEntries: number;
+}): number {
+	return (
+		stats.recentlyCleanNeighborCacheSize * 320 + stats.sessionFactEntries * 440
+	);
+}
+
 export function collectMemorySampleSubsystems(
 	wordIndex: WordIndex | null,
 ): MemorySampleSubsystems {
@@ -127,28 +270,59 @@ export function collectMemorySampleSubsystems(
 	const dispatchCaches = getDispatchCascadeCacheStats();
 
 	return {
+		lsp: (() => {
+			const retention = getLspDocumentTextRetentionSnapshot();
+			return {
+				clients: retention.clients,
+				clientRoots: retention.roots,
+				incrementalTextEntries: retention.entries,
+				incrementalTextBytes: retention.bytes,
+			};
+		})(),
 		reviewGraph,
 		wordIndex: wordIndex
 			? {
 					docs: wordIndex.docLengths.size,
+					fileTable: wordIndex.fileTable.size,
 					postings: wordIndex.postings.size,
+					// O(distinct tokens), reading only `.length`/`.byteLength` per
+					// list — no posting ELEMENT is touched, so this stays inside the
+					// module docstring’s bounded-read constraint.
+					postingEntries: countPostingEntries(wordIndex),
+					residentBytes: estimateWordIndexStoreBytes(wordIndex),
 					forwardEntries: wordIndex.forward?.size ?? 0,
 				}
 			: null,
 		treeSitter,
-		dispatchCaches,
+		dispatchCaches: {
+			...dispatchCaches,
+			estimatedBytes: estimateDispatchCacheBytes(dispatchCaches),
+		},
 	};
 }
 
 /** Assemble one full sample. `mem` is injectable for tests; defaults to a
- *  live `process.memoryUsage()` read. */
+ *  live `process.memoryUsage()` read. `resourceUsage` (peak working set) and
+ *  `session` are optional ridealongs (#1999); when `resourceUsage` is omitted
+ *  a live `process.resourceUsage()` read supplies the peak. */
 export function buildMemorySample(
 	wordIndex: WordIndex | null,
 	mem: NodeJS.MemoryUsage = process.memoryUsage(),
+	resourceUsage?: Partial<NodeJS.ResourceUsage>,
+	session?: MemorySampleSessionContext,
 ): MemorySample {
+	let resolvedResourceUsage = resourceUsage;
+	if (!resolvedResourceUsage) {
+		try {
+			resolvedResourceUsage = process.resourceUsage();
+		} catch {
+			resolvedResourceUsage = undefined;
+		}
+	}
 	return {
-		process: toMemoryProcessUsage(mem),
+		process: toMemoryProcessUsage(mem, resolvedResourceUsage),
 		subsystems: collectMemorySampleSubsystems(wordIndex),
+		session,
 	};
 }
 
@@ -170,8 +344,15 @@ export function formatMemoryHealthLine(sample: MemorySample): string {
 		? `${toMb(subsystems.treeSitter.treeCacheTotalBytes)}MB (${subsystems.treeSitter.treeCacheSize} trees)`
 		: "n/a";
 	const graph = `${subsystems.reviewGraph.totalNodes}n/${subsystems.reviewGraph.totalEdges}e (${subsystems.reviewGraph.cacheEntries} cwd)`;
+	// #1999: peak WS rides along when known — rss far below peak means the
+	// periodic samples are catching idle valleys, not the true high-water mark.
+	const peak =
+		proc.peakWorkingSetBytes !== null
+			? ` · peak WS ${toMb(proc.peakWorkingSetBytes)}MB`
+			: "";
 	return (
 		`Memory: RSS ${toMb(proc.rssBytes)}MB · heap ${toMb(proc.heapUsedBytes)}/${toMb(proc.heapTotalBytes)}MB` +
-		` · external ${toMb(proc.externalBytes)}MB · tree-sitter cache ${treeCache} · review-graph ${graph}`
+		` · external ${toMb(proc.externalBytes)}MB${peak}` +
+		` · tree-sitter cache ${treeCache} · review-graph ${graph}`
 	);
 }

@@ -27,6 +27,7 @@ import { recordDegradation } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
 import { isFullyQualifiedWin32 } from "./path-utils.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { compareOrdinal } from "./string-utils.js";
 
 export interface SpawnResourceUsage {
 	sampleCount: number;
@@ -149,6 +150,10 @@ export interface SpawnResult {
 	};
 	/** True when stdout or stderr was capped before process completion. */
 	outputTruncated?: boolean;
+	/** True when the output cap started terminating the child. */
+	killedForOutputCap?: boolean;
+	/** True when the optional streaming matcher saw a matching chunk. */
+	streamingMatch?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
 	 *  `undefined` when no sample ever landed (process exited faster than the
 	 *  first poll tick, or sampling failed for the whole invocation) — never
@@ -344,6 +349,10 @@ export interface SafeSpawnOptions {
 	resourceLabel?: string;
 	/** Maximum bytes retained across stdout and stderr for this child. */
 	maxOutputBytes?: number;
+	/** Match output chunks before output-cap truncation can discard them. */
+	matchWhileStreaming?: RegExp;
+	/** Optional stdin payload. Supplying it always writes and closes stdin. */
+	input?: string;
 	/**
 	 * Couple a long-lived, side-effecting child to this Node process. Registered
 	 * children are synchronously tree-killed during process exit/signals.
@@ -389,7 +398,14 @@ function killPidTreeSync(pid: number): void {
 		return;
 	}
 	try {
-		process.kill(pid, "SIGKILL");
+		// #2026: negative pid = whole process group (POSIX children spawn
+		// detached), reaching grandchildren too. Any failure (ESRCH = already
+		// gone, EPERM = raced) falls through to the direct-child attempt.
+		try {
+			process.kill(-pid, "SIGKILL");
+		} catch {
+			process.kill(pid, "SIGKILL");
+		}
 	} catch {
 		// Child already exited.
 	}
@@ -468,13 +484,19 @@ function cmdEscapeArg(arg: string): string {
  * that already worked. The `chcp 65001` prefix forces the UTF-8 code page (so
  * tool output isn't mangled by the system code page) and, as a side benefit,
  * keeps the (possibly quoted) command off the front of the line, avoiding
- * cmd.exe's `/s` outer-quote-stripping quirk.
+ * cmd.exe's `/s` outer-quote-stripping quirk. #2023: chcp is invoked via its
+ * absolute `%SystemRoot%\System32\chcp.com` path and chained with `&`, not
+ * `&&` — a child environment whose PATH cannot resolve System32 used to fail
+ * the bare `chcp` lookup, and `&&` then short-circuited EVERY .cmd/.bat spawn
+ * into exit 1 with empty output. With the pin plus `&`, even a chcp failure
+ * can never suppress the real command.
  */
 export function buildWindowsShellCommand(
 	command: string,
 	args: string[],
 ): string {
-	return `chcp 65001 >nul 2>&1 && ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
+	const chcp = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\chcp.com`;
+	return `${chcp} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
 }
 
 // ============================================================================
@@ -933,7 +955,7 @@ export function resolveWindowsCommandForEnvironment(
 				? ([[key.toLowerCase(), value] as const] as const)
 				: [],
 		)
-		.sort(([left], [right]) => left.localeCompare(right));
+		.sort(([left], [right]) => compareOrdinal(left, right));
 	// Keep presence separate from value: absent PATHEXT means the Windows
 	// default extension list, while PATHEXT="" means no implicit extensions.
 	// The per-drive snapshot is equally important: it is provenance for
@@ -1040,6 +1062,13 @@ function ensureUtf8ConsoleCodePageOnce(): void {
 		spawnSync(cmdExe, ["/d", "/s", "/c", "chcp 65001 >nul 2>&1"], {
 			shell: false,
 			windowsHide: true,
+			// #1980 population sweep: a synchronous spawn with no timeout parks
+			// the event loop for as long as the child takes, and nothing here
+			// bounds that. `chcp` is normally instant, but this runs before the
+			// FIRST real spawn of the process, which is exactly when a cold or
+			// antivirus-throttled cmd.exe is slowest. Matches the 5s bound every
+			// other synchronous child-process site in this repo already carries.
+			timeout: 5000,
 		});
 	} catch {
 		// Best-effort: worst case is non-ASCII tool output decoded incorrectly, not a
@@ -1151,6 +1180,8 @@ export async function safeSpawnAsync(
 		let aborted = false;
 		let killed = false;
 		let outputTruncated = false;
+		let killedForOutputCap = false;
+		let streamingMatch = false;
 		// #1651 review: a single boolean the close/error handlers both check
 		// AND set, so whichever one decides the outcome first wins outright —
 		// the DECISION itself is shape-based (see the `close` handler below),
@@ -1198,19 +1229,126 @@ export async function safeSpawnAsync(
 			options.maxOutputBytes > 0
 				? Math.floor(options.maxOutputBytes)
 				: undefined;
-		const appendOutput = (current: string, chunk: string | Buffer): string => {
-			const text = typeof chunk === "string" ? chunk : chunk.toString();
-			if (maxOutputBytes === undefined) return current + text;
-			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
-			const remaining = maxOutputBytes - used;
-			if (remaining <= 0) {
-				outputTruncated = true;
-				return current;
+		const outputTruncationMarker = "\n...[output truncated]...\n";
+		type OutputStream = "stdout" | "stderr";
+		type OutputPart = { stream: OutputStream; text: string };
+		let retainedHead: OutputPart[] = [];
+		let retainedTail: OutputPart[] = [];
+		let retainedTailBytes = 0;
+		let retainedTailLimit = 0;
+		let truncationStream: OutputStream = "stderr";
+		const streamingMatcher = options?.matchWhileStreaming;
+		const streamingCarryBytes = streamingMatcher
+			? Math.max(0, streamingMatcher.source.length - 1)
+			: 0;
+		const streamingCarry: Record<OutputStream, string> = {
+			stdout: "",
+			stderr: "",
+		};
+		const bytePrefix = (text: string, bytes: number): string =>
+			Buffer.from(text).subarray(0, bytes).toString();
+		const byteSuffix = (text: string, bytes: number): string => {
+			const buffer = Buffer.from(text);
+			return buffer.subarray(Math.max(0, buffer.byteLength - bytes)).toString();
+		};
+		const appendTail = (part: OutputPart, maxBytes: number): void => {
+			if (maxBytes <= 0) return;
+			retainedTail.push({ stream: part.stream, text: part.text });
+			retainedTailBytes += Buffer.byteLength(part.text);
+			while (retainedTailBytes > maxBytes && retainedTail.length > 0) {
+				const first = retainedTail[0];
+				const excess = retainedTailBytes - maxBytes;
+				const firstBytes = Buffer.byteLength(first.text);
+				if (firstBytes <= excess) {
+					retainedTail.shift();
+					retainedTailBytes -= firstBytes;
+				} else {
+					first.text = byteSuffix(first.text, firstBytes - excess);
+					retainedTailBytes -= excess;
+				}
 			}
+		};
+		const renderOutput = (stream: OutputStream): string => {
+			const head = retainedHead
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const tail = retainedTail
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const marker = stream === truncationStream ? outputTruncationMarker : "";
+			return head + marker + tail;
+		};
+		const refreshRetainedOutputs = (): void => {
+			stdout = renderOutput("stdout");
+			stderr = renderOutput("stderr");
+		};
+		const appendOutput = (
+			stream: OutputStream,
+			current: string,
+			chunk: string | Buffer,
+		): string => {
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			if (maxOutputBytes === undefined || outputTruncated) {
+				if (maxOutputBytes === undefined) return current + text;
+				appendTail({ stream, text }, retainedTailLimit);
+				truncationStream = stream;
+				return renderOutput(stream);
+			}
+			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
 			const bytes = Buffer.byteLength(text);
-			if (bytes <= remaining) return current + text;
+			if (used + bytes <= maxOutputBytes) return current + text;
 			outputTruncated = true;
-			return current + Buffer.from(text).subarray(0, remaining).toString();
+			truncationStream = stream;
+			const available = Math.max(
+				0,
+				maxOutputBytes - Buffer.byteLength(outputTruncationMarker),
+			);
+			const headBytes = Math.floor(available / 2);
+			const tailBytes = available - headBytes;
+			retainedTailLimit = tailBytes;
+			const parts: OutputPart[] = [
+				{ stream: "stdout", text: stdout },
+				{ stream: "stderr", text: stderr },
+				{ stream, text },
+			];
+			let headRemaining = headBytes;
+			for (const part of parts) {
+				if (headRemaining <= 0) break;
+				const kept = bytePrefix(part.text, headRemaining);
+				if (kept) retainedHead.push({ stream: part.stream, text: kept });
+				headRemaining -= Buffer.byteLength(kept);
+			}
+			let tailRemaining = tailBytes;
+			for (
+				let index = parts.length - 1;
+				index >= 0 && tailRemaining > 0;
+				index--
+			) {
+				const part = parts[index];
+				const kept = byteSuffix(part.text, tailRemaining);
+				if (kept) {
+					retainedTail.unshift({ stream: part.stream, text: kept });
+					tailRemaining -= Buffer.byteLength(kept);
+				}
+			}
+			retainedTailBytes = tailBytes - tailRemaining;
+			return renderOutput(stream);
+		};
+		const matchStreamingChunk = (
+			stream: OutputStream,
+			chunk: string | Buffer,
+		): void => {
+			if (streamingMatch || !streamingMatcher) return;
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			streamingMatcher.lastIndex = 0;
+			streamingMatch = streamingMatcher.test(streamingCarry[stream] + text);
+			if (streamingCarryBytes > 0) {
+				streamingCarry[stream] = Buffer.from(streamingCarry[stream] + text)
+					.subarray(-streamingCarryBytes)
+					.toString();
+			}
 		};
 
 		// Spawn the process (non-blocking). Keeping Node's `shell` option false
@@ -1318,6 +1456,14 @@ export async function safeSpawnAsync(
 		}
 
 		let child: ChildProcess;
+		// #2026: on POSIX, run the child in its OWN process group (detached).
+		// killTree/killPidTreeSync then signal the whole GROUP (-pid), which
+		// makes grandchildren (npm -> node, sh -> sleep, etc.) die with their
+		// tool instead of surviving every timeout as orphans. Detachment stops
+		// direct terminal-signal delivery, so EVERY POSIX pid registers for
+		// lifetime cleanup - pi's signal/exit handlers forward the kill,
+		// preserving die-with-host semantics.
+		const posixProcessGroup = process.platform !== "win32";
 		try {
 			child = spawn(spawnCmd, spawnArgs, {
 				cwd: spawnCwd,
@@ -1325,6 +1471,7 @@ export async function safeSpawnAsync(
 				windowsHide: true,
 				shell: false,
 				windowsVerbatimArguments,
+				detached: posixProcessGroup,
 			});
 		} catch (err) {
 			// A SYNCHRONOUS spawn throw (Windows `spawn UNKNOWN`/EINVAL — the
@@ -1348,7 +1495,16 @@ export async function safeSpawnAsync(
 			);
 			return;
 		}
-		if (options?.lifetimeCoupled && child.pid) {
+		// Keep historical open stdin by default. An opted-in payload is written
+		// completely and followed by EOF; input: "" closes stdin immediately.
+		if (options?.input !== undefined) {
+			child.stdin?.on("error", () => {});
+			child.stdin?.end(options.input);
+		}
+		if (child.pid && (posixProcessGroup || options?.lifetimeCoupled)) {
+			// #2026: POSIX registers unconditionally - detached children no
+			// longer receive terminal signals directly, so the lifetime
+			// cleanup's signal forwarding IS their die-with-host path.
 			installLifetimeCleanup();
 			lifetimeState.pids.add(child.pid);
 		}
@@ -1395,6 +1551,44 @@ export async function safeSpawnAsync(
 				} catch {
 					child.kill("SIGKILL");
 				}
+			} else if (posixProcessGroup && child.pid && child.pid > 0) {
+				// #2026: signal the whole process group. Grandchildren spawned
+				// by the tool share its group, so one signal reaches the whole
+				// tree; a negative-pid ESRCH means it already exited.
+				const pgid = -child.pid;
+				try {
+					process.kill(pgid, "SIGTERM");
+				} catch {
+					child.kill("SIGTERM");
+				}
+				// #2027 round-1: gate the SIGKILL escalation on GROUP liveness,
+				// not direct-child death - a tool can exit instantly on SIGTERM
+				// while a SIGTERM-hardy grandchild keeps the group alive. The
+				// timer stays REF'D for group mode (max 1s tail after resolve):
+				// it is the only backstop for this group once finalize deletes
+				// the pid from lifetimeState.
+				escalationTimer = setTimeout(() => {
+					let groupAlive = true;
+					try {
+						process.kill(pgid, 0);
+					} catch {
+						groupAlive = false;
+					}
+					if (!groupAlive) return;
+					teardownEscalated = true;
+					logLatency({
+						type: "phase",
+						phase: "spawn_group_kill_escalation",
+						filePath: "",
+						durationMs: 0,
+						metadata: { pgid: child.pid },
+					});
+					try {
+						process.kill(pgid, "SIGKILL");
+					} catch {
+						// Raced with group exit.
+					}
+				}, 1000);
 			} else {
 				child.kill("SIGTERM");
 				escalationTimer = setTimeout(() => {
@@ -1417,11 +1611,20 @@ export async function safeSpawnAsync(
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 
 		// Output-cap kills are awaited by finalize() below, just like
-		// timeout/abort kills. This keeps a noisy CLI from continuing in the
-		// background after its retained output has been bounded.
+		// timeout/abort kills. An armed, unmatched streaming matcher is the one
+		// exception: retention remains bounded, but the caller's timeout is the
+		// bound while the child gets a chance to emit its rescue line.
 		let killPromise: Promise<void> | undefined;
 		const stopForOutputLimit = (): void => {
-			if (outputTruncated && !killed && !child.killed) {
+			const waitingForStreamingMatch =
+				streamingMatcher !== undefined && !streamingMatch;
+			if (
+				outputTruncated &&
+				!waitingForStreamingMatch &&
+				!killed &&
+				!child.killed
+			) {
+				killedForOutputCap = true;
 				killed = true;
 				killPromise = killTree();
 			}
@@ -1431,12 +1634,16 @@ export async function safeSpawnAsync(
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
 		child.stdout?.on("data", (data) => {
-			stdout = appendOutput(stdout, data);
+			matchStreamingChunk("stdout", data);
+			stdout = appendOutput("stdout", stdout, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
-			stderr = appendOutput(stderr, data);
+			matchStreamingChunk("stderr", data);
+			stderr = appendOutput("stderr", stderr, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
@@ -1610,10 +1817,14 @@ export async function safeSpawnAsync(
 			// else has ALREADY resolved, never on `error` merely having fired.
 			await killPromise;
 			if (resolved) return;
-			// #1109: the child has exited — if killTree armed the non-Windows
-			// SIGTERM→SIGKILL escalation timer and it hasn't fired yet, clear it
-			// so it doesn't linger as a ref'd handle after this promise resolves.
-			if (escalationTimer) clearTimeout(escalationTimer);
+			// #1109: the child has exited - clear the non-Windows escalation
+			// timer so it doesn't linger as a ref'd handle. #2027 EXCEPTION:
+			// in POSIX group mode the timer is the liveness-gated SIGKILL
+			// backstop for SIGTERM-hardy grandchildren; it stays armed and
+			// self-cleans within 1s of firing (max 1s ref'd tail).
+			if (escalationTimer && !posixProcessGroup) {
+				clearTimeout(escalationTimer);
+			}
 			// #1673 review F1: latch the verdict as DECIDED here, before the
 			// idle-pipe wait — not after it. `code`/`signal`/`timedOut`/`aborted`
 			// are already fixed by this point (they don't change during the
@@ -1631,7 +1842,11 @@ export async function safeSpawnAsync(
 			await waitForPipeIdle();
 			const resourceUsage = finishResourceUsage();
 
-			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
+			const outputInfo = {
+				...(outputTruncated ? { outputTruncated: true } : {}),
+				...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+			};
+			const streamingMatchInfo = streamingMatch ? { streamingMatch: true } : {};
 			// #1816: surface the signal name as a field on every path where one
 			// exists, so callers can NAME it instead of scraping `error.message`.
 			const signalInfo = signal ? { signal } : {};
@@ -1658,6 +1873,7 @@ export async function safeSpawnAsync(
 					...(timeoutTeardown && { timeoutTeardown }),
 					spawnFailure: new SpawnFailureError("timeout", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (aborted) {
@@ -1671,6 +1887,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (signal) {
@@ -1684,6 +1901,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (code === null || code < 0) {
@@ -1712,10 +1930,18 @@ export async function safeSpawnAsync(
 					failure: "spawn",
 					spawnFailure,
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else {
-				resolve({ stdout, stderr, status: code, ...outputInfo, resourceUsage });
+				resolve({
+					stdout,
+					stderr,
+					status: code,
+					...outputInfo,
+					...streamingMatchInfo,
+					resourceUsage,
+				});
 			}
 		};
 
@@ -1735,7 +1961,10 @@ export async function safeSpawnAsync(
 			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
-			if (escalationTimer) clearTimeout(escalationTimer);
+			// #2027: group-mode timer stays armed as the grandchild backstop.
+			if (escalationTimer && !posixProcessGroup) {
+				clearTimeout(escalationTimer);
+			}
 			if (child.pid) lifetimeState.pids.delete(child.pid);
 			const resourceUsage = finishResourceUsage();
 			let failure: SpawnFailureKind = "spawn";
@@ -1755,6 +1984,8 @@ export async function safeSpawnAsync(
 					failure,
 					spawnFailure,
 					...(outputTruncated ? { outputTruncated: true } : {}),
+					...(killedForOutputCap ? { killedForOutputCap: true } : {}),
+					...(streamingMatch ? { streamingMatch: true } : {}),
 					resourceUsage,
 				});
 			if (controlFailure) finish(controlFailure);

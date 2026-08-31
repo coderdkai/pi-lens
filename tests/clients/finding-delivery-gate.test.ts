@@ -64,6 +64,8 @@ const EXPECTED_SURFACE_IDS = [
 	"runtime-turn:actionable-warnings-advisory",
 	"runtime-turn:code-quality-warnings-advisory",
 	"runtime-turn:disposition-suppressed-notice",
+	"runtime-turn:late-auxiliary-findings",
+	"runtime-turn:late-runner-findings",
 	"runtime-turn:cascade-blocker",
 	"runtime-turn:cascade-coverage-advisory",
 	"runtime-turn:call-graph-advisory",
@@ -72,7 +74,18 @@ const EXPECTED_SURFACE_IDS = [
 	"lens-diagnostics:mode-delta",
 	"widget-state:footer",
 	"agent-nudge:context-message",
+	"test-runner-delivery:custom-entry",
 	"project-diagnostics:persisted-snapshot",
+	// #2028: the remaining agent-facing surfaces.
+	"tool-call:stop-blocker",
+	"lsp-diagnostics:tool-output",
+	"git-guard:commit-blocked",
+	"read-guard-tool-lines:preflight-errors",
+	"agent-behavior:thrashing-notice",
+	"tool-call:duplicate-export-blocker",
+	// #2007: the shared-checkout refusal, the same live-preflight shape as
+	// `git-guard:commit-blocked`.
+	"shared-checkout-guard:worktree-mutation-blocked",
 ].sort();
 
 // ── Real seam scan (#1634 review F2) ────────────────────────────────────────

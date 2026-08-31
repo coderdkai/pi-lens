@@ -7,7 +7,7 @@
  * - Platform-specific handling
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { access, readFile, readdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -31,9 +31,16 @@ import {
 } from "../path-utils.js";
 import {
 	ensureTool,
+	findManagedToolBinary,
 	getToolEnvironment,
 	getToolPath,
 } from "../installer/index.js";
+import * as installer from "../installer/index.js";
+import {
+	classifyProbeFailure,
+	describeInstallAttempt,
+	logAvailabilityDecision,
+} from "../dispatch/runners/utils/availability-policy.js";
 import { resolveOpengrepConfig } from "../opengrep-config.js";
 import {
 	isZizmorAuditTarget,
@@ -55,6 +62,11 @@ import { createLombokJdtlsArgs } from "./lombok.js";
 import { resolveJavaRuntimeEnv } from "./jvm-runtime.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getRubyVersionDirNamesSync } from "./ruby-drive-dirs.js";
+import { getProcessSingleton } from "../process-singletons.js";
+import {
+	createGenerationSource,
+	type GenerationHandle,
+} from "../generation-guard.js";
 
 // --- Types ---
 
@@ -110,13 +122,81 @@ const PROJECT_BOUNDARY_MARKERS = [
 // process (not once per session). Keep the root-boundary marker below aligned
 // with FALLBACK_PROJECT_MARKERS, the shared fallback root-policy marker set.
 const loggedRootCeilingClamps = new Set<string>();
+const posixCaseInsensitiveByPath = new Map<string, boolean>();
 
-function isSameOrWithin(ancestor: string, candidate: string): boolean {
+export type IsSameOrWithinDeps = {
+	caseInsensitiveProbe?: (root: string) => boolean;
+};
+
+function posixFilesystemIsCaseInsensitive(root: string): boolean {
+	const resolved = path.resolve(root);
+	const cached = posixCaseInsensitiveByPath.get(resolved);
+	if (cached !== undefined) return cached;
+	if (!existsSync(resolved)) {
+		return false;
+	}
+	const name = path.basename(resolved);
+	const alternate =
+		name.toLowerCase() === name ? name.toUpperCase() : name.toLowerCase();
+	let insensitive = false;
+	const alternatePath = path.join(path.dirname(resolved), alternate);
+	if (alternate !== name && existsSync(alternatePath)) {
+		try {
+			const actual = statSync(resolved);
+			const alternateStat = statSync(alternatePath);
+			insensitive =
+				actual.dev === alternateStat.dev && actual.ino === alternateStat.ino;
+		} catch {
+			insensitive = false;
+		}
+	}
+	posixCaseInsensitiveByPath.set(resolved, insensitive);
+	return insensitive;
+}
+
+export function resetLSPCaseSensitivityState(): void {
+	posixCaseInsensitiveByPath.clear();
+}
+
+export function _getPosixCaseSensitivityCacheSizeForTests(): number {
+	return posixCaseInsensitiveByPath.size;
+}
+
+/**
+ * Path-shape-aware containment test: is `candidate` the same path as
+ * `ancestor`, or inside it?
+ *
+ * Exported so the session-cwd registry (`clients/lsp/config.ts`) and the
+ * foreign-root decline gate (`clients/lsp/index.ts`) test containment with the
+ * SAME comparator the root ceiling uses. A second hand-rolled `path.relative`
+ * helper alongside this one is how the two drift apart on Windows-shaped
+ * paths (shape 2 / #1150): `path.isAbsolute("C:\\repo")` is false on POSIX, so
+ * a host-default comparator silently mis-answers a win32 path on Linux CI.
+ */
+export function isSameOrWithin(
+	ancestor: string,
+	candidate: string,
+	deps: IsSameOrWithinDeps = {},
+): boolean {
 	const windowsShaped = isWindowsPath(ancestor) || isWindowsPath(candidate);
 	const pathApi = windowsShaped ? path.win32 : path;
+	const resolvedAncestor = pathApi.resolve(ancestor);
+	const resolvedCandidate = pathApi.resolve(candidate);
+	let caseInsensitive = false;
+	if (!windowsShaped) {
+		if (deps.caseInsensitiveProbe) {
+			const cached = posixCaseInsensitiveByPath.get(resolvedAncestor);
+			caseInsensitive = cached ?? deps.caseInsensitiveProbe(resolvedAncestor);
+			if (cached === undefined) {
+				posixCaseInsensitiveByPath.set(resolvedAncestor, caseInsensitive);
+			}
+		} else {
+			caseInsensitive = posixFilesystemIsCaseInsensitive(resolvedAncestor);
+		}
+	}
 	const relative = pathApi.relative(
-		pathApi.resolve(ancestor),
-		pathApi.resolve(candidate),
+		caseInsensitive ? resolvedAncestor.toLowerCase() : resolvedAncestor,
+		caseInsensitive ? resolvedCandidate.toLowerCase() : resolvedCandidate,
 	);
 	return (
 		relative === "" ||
@@ -334,6 +414,63 @@ const DIRECT_LSP_NEGATIVE_TTL_MS = Math.max(
 const directLspCommandUnavailableUntil = new Map<string, number>();
 const directLspCommandSkipLoggedUntil = new Map<string, number>();
 
+// Availability rows are emitted from the same async launch path that owns the
+// live LSP generation. A session reset can retire that generation while a
+// managed lookup, install, or launch is still awaiting; stale work must not
+// publish into the replacement session (#2351, shape 22).
+const lspLaunchAvailabilityGeneration = createGenerationSource(
+	"lsp-launch-availability",
+);
+
+export function resetLspLaunchAvailabilityGeneration(): void {
+	lspLaunchAvailabilityGeneration.bump();
+}
+
+function staleLaunch(
+	generation: GenerationHandle,
+	subject: string,
+	proc?: LSPProcess,
+): boolean {
+	if (generation.isCurrent()) return false;
+	try {
+		proc?.process?.kill();
+	} catch {
+		// Best-effort cleanup for a process returned after service retirement.
+	}
+	generation.guardedWrite(subject, () => undefined);
+	return true;
+}
+
+async function installEvidenceForLaunch(
+	toolId: string,
+	installed: string,
+	attempt: Parameters<typeof describeInstallAttempt>[0],
+): Promise<Record<string, unknown>> {
+	const evidence = describeInstallAttempt(attempt);
+	const confirmedManagedPath = await findManagedToolBinary(toolId);
+	return {
+		...evidence,
+		binary: path.basename(installed),
+		...(confirmedManagedPath !== undefined &&
+			pathsEqual(confirmedManagedPath, installed) && {
+				source: "managed-dir",
+			}),
+	};
+}
+
+function captureInstallAttempt(
+	toolId: string,
+): Parameters<typeof describeInstallAttempt>[0] {
+	try {
+		// Capture synchronously after ensureTool resolves. Reading this later, after
+		// launch/evidence awaits, can observe another concurrent ensure's outcome.
+		return installer.getInstallAttempt?.(toolId);
+	} catch {
+		// Older test doubles do not expose this production export.
+	}
+	return undefined;
+}
+
 /** Re-arm direct-command availability for the next session. */
 export function resetDirectLspCommandAvailability(): void {
 	directLspCommandUnavailableUntil.clear();
@@ -442,6 +579,7 @@ export async function resolveAndLaunch(
 	| { process: LSPProcess; source: "direct" | "managed" | "package-manager" }
 	| undefined
 > {
+	const generation = lspLaunchAvailabilityGeneration.capture();
 	const toolLabel =
 		spec.managedToolId ??
 		spec.candidates[spec.candidates.length - 1] ??
@@ -453,6 +591,30 @@ export async function resolveAndLaunch(
 			lastRuntimeFailure = err instanceof Error ? err : new Error(message);
 		}
 	};
+
+	// #2140: consult the release-managed binary directory (~/.pi-lens/bin)
+	// BEFORE the bare-PATH candidates below. A bare `candidates: ["opengrep"]`
+	// entry only ever resolves through the OS's own PATH lookup — never that
+	// directory — so a github/maven/archive-strategy tool installed there with
+	// no PATH entry ENOENTs every direct candidate first, only to have the
+	// managed-install step further down find the very same binary a few
+	// hundred ms later. `findManagedToolBinary` does a bare `fs.access`, no
+	// spawn, so this costs at most a few stat calls per server launch attempt
+	// (not per file/dispatch — launches are session-scoped). Mirrors
+	// `findManagedNodeToolBinary`'s npm-managed fast path (runner-helpers.ts)
+	// and `SecurityScanClient.probeVersion`'s equivalent fix for the CLI-scan
+	// half of this same issue (#2140, landed in PR #2148/#2137).
+	const managedProbeStartedAt = Date.now();
+	const managedCandidate = spec.managedToolId
+		? await findManagedToolBinary(spec.managedToolId)
+		: undefined;
+	if (staleLaunch(generation, `${toolLabel}:findManagedToolBinary`)) {
+		return undefined;
+	}
+	const candidates =
+		managedCandidate && !spec.candidates.includes(managedCandidate)
+			? [managedCandidate, ...spec.candidates]
+			: spec.candidates;
 
 	// A candidate that fails while a LATER candidate (or managed install)
 	// succeeds is just fallback, not a failure — logging each immediately floods
@@ -467,7 +629,7 @@ export async function resolveAndLaunch(
 	}> = [];
 
 	// Step 1 & 2 — try all explicit candidates (includes bare command = PATH lookup)
-	for (const [index, command] of spec.candidates.entries()) {
+	for (const [index, command] of candidates.entries()) {
 		logLatency({
 			type: "phase",
 			phase: "lsp_launch_candidate_attempt",
@@ -477,18 +639,21 @@ export async function resolveAndLaunch(
 				tool: toolLabel,
 				command,
 				index,
-				totalCandidates: spec.candidates.length,
+				totalCandidates: candidates.length,
 				allowInstall: canInstall(allowInstall),
 			},
 		});
 		logSessionStart(
-			`lsp launch candidate attempt tool=${toolLabel} idx=${index}/${spec.candidates.length - 1} command=${command} cwd=${spec.cwd}`,
+			`lsp launch candidate attempt tool=${toolLabel} idx=${index}/${candidates.length - 1} command=${command} cwd=${spec.cwd}`,
 		);
 		try {
 			const proc = await launchLSP(command, spec.args, {
 				cwd: spec.cwd,
 				env: spec.env,
 			});
+			if (staleLaunch(generation, `${toolLabel}:launchLSP:${command}`, proc)) {
+				return undefined;
+			}
 			logLatency({
 				type: "phase",
 				phase: "lsp_launch_candidate_success",
@@ -504,8 +669,35 @@ export async function resolveAndLaunch(
 			logSessionStart(
 				`lsp launch candidate success tool=${toolLabel} idx=${index} command=${command} source=direct`,
 			);
+			// The managed-dir fast path (#2140) IS the availability probe for a
+			// release-managed tool: a real spawn just confirmed the binary
+			// findManagedToolBinary resolved actually launches. Gated on the exact
+			// managed candidate (never a later bare-PATH fallback), so a session
+			// start with the binary present emits exactly one decision and a
+			// developer-PATH-resolved copy (no managed binary at all) emits none —
+			// unchanged from before this fix.
+			if (managedCandidate !== undefined && command === managedCandidate) {
+				logAvailabilityDecision({
+					tool: toolLabel,
+					verdict: "available",
+					outcome: "success",
+					cause: "ok",
+					elapsedMs: Date.now() - managedProbeStartedAt,
+					latched: false,
+					producer: "lsp-launch",
+					classifiedBy: "probe",
+					evidence: {
+						binary: path.basename(managedCandidate),
+						source: "managed-dir",
+						correctsLatchedRow: false,
+					},
+				});
+			}
 			return { process: proc, source: "direct" };
 		} catch (err) {
+			if (staleLaunch(generation, `${toolLabel}:launchLSP:${command}`)) {
+				return undefined;
+			}
 			const message = err instanceof Error ? err.message : String(err);
 			// Defer logging: only a failure if no later candidate/install succeeds.
 			candidateFailures.push({ index, command, message, err });
@@ -561,10 +753,46 @@ export async function resolveAndLaunch(
 
 	// Step 3 — managed install via installer registry
 	if (spec.managedToolId) {
+		// Neither the managed-dir stat (#2140) nor any bare-PATH candidate
+		// resolved this tool — the negative counterpart to the fast-path
+		// "available" decision above, mirroring `SecurityScanClient.probeVersion`'s
+		// failure record so the negative case is visible in latency.log rather
+		// than swallowed by going straight to the install attempt.
+		const failedCandidate = candidateFailures.at(-1);
+		const classifiedFailure = classifyProbeFailure(
+			{
+				error:
+					failedCandidate?.err instanceof Error
+						? failedCandidate.err
+						: undefined,
+				spawnFailure: {
+					kind: hasSpawnFailureKind(failedCandidate?.err, "tool-not-found")
+						? "tool-not-found"
+						: undefined,
+				},
+			},
+			{ command: failedCandidate?.command },
+		);
+		logAvailabilityDecision({
+			tool: spec.managedToolId,
+			verdict: "unavailable",
+			outcome: classifiedFailure.outcome,
+			cause: classifiedFailure.cause,
+			elapsedMs: Date.now() - managedProbeStartedAt,
+			latched: false,
+			classifiedBy: "probe",
+			producer: "lsp-launch",
+			evidence: classifiedFailure.evidence,
+		});
 		logSessionStart(
 			`lsp launch ensure-tool start tool=${spec.managedToolId} cwd=${spec.cwd}`,
 		);
+		const installStartedAt = Date.now();
 		const installed = await ensureTool(spec.managedToolId);
+		const installAttempt = captureInstallAttempt(spec.managedToolId);
+		if (staleLaunch(generation, `${toolLabel}:ensureTool`)) {
+			return undefined;
+		}
 		logSessionStart(
 			`lsp launch ensure-tool result tool=${spec.managedToolId} installed=${installed ? "yes" : "no"} path=${installed ?? ""}`,
 		);
@@ -585,6 +813,9 @@ export async function resolveAndLaunch(
 					cwd: spec.cwd,
 					env: spec.env,
 				});
+				if (staleLaunch(generation, `${toolLabel}:launchLSP:managed`, proc)) {
+					return undefined;
+				}
 				logSessionStart(
 					`lsp launch managed success tool=${spec.managedToolId} command=${installed} source=managed`,
 				);
@@ -598,8 +829,42 @@ export async function resolveAndLaunch(
 						command: installed,
 					},
 				});
+				// Compensating row for the "unavailable" decision logged above (#1606
+				// shape): the install fixed exactly what the fast path found missing,
+				// so the durable record must not be left saying the tool is off.
+				// `source` is only asserted when a fresh managed-dir lookup confirms
+				// the install actually landed in ~/.pi-lens/bin (github/maven/archive
+				// strategies) rather than an npm/pip/gem install elsewhere, so the
+				// evidence never claims a resolution this call didn't derive.
+				const evidence = await installEvidenceForLaunch(
+					spec.managedToolId,
+					installed,
+					installAttempt,
+				);
+				if (staleLaunch(generation, `${toolLabel}:managed-evidence`, proc)) {
+					return undefined;
+				}
+				logAvailabilityDecision({
+					tool: spec.managedToolId,
+					verdict: "available",
+					outcome: "success",
+					cause: "ok",
+					elapsedMs: Date.now() - installStartedAt,
+					latched: false,
+					classifiedBy: "caller",
+					producer: "lsp-launch",
+					evidence: {
+						...evidence,
+						correctsLatchedRow: false,
+					},
+				});
 				return { process: proc, source: "managed" };
 			} catch (err) {
+				if (
+					staleLaunch(generation, `${toolLabel}:launchLSP:managed-rejection`)
+				) {
+					return undefined;
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				logSessionStart(
 					`lsp launch managed failed tool=${spec.managedToolId} command=${installed} error=${message}`,
@@ -629,12 +894,25 @@ export async function resolveAndLaunch(
 					const reinstalled = await ensureTool(spec.managedToolId, {
 						forceReinstall: true,
 					});
+					const reinstallAttempt = captureInstallAttempt(spec.managedToolId);
+					if (staleLaunch(generation, `${toolLabel}:forceReinstall`)) {
+						return undefined;
+					}
 					if (reinstalled) {
 						try {
 							const proc = await launchLSP(reinstalled, spec.args, {
 								cwd: spec.cwd,
 								env: spec.env,
 							});
+							if (
+								staleLaunch(
+									generation,
+									`${toolLabel}:launchLSP:forceReinstall`,
+									proc,
+								)
+							) {
+								return undefined;
+							}
 							logSessionStart(
 								`lsp launch managed force-reinstall success tool=${spec.managedToolId} command=${reinstalled}`,
 							);
@@ -646,6 +924,34 @@ export async function resolveAndLaunch(
 								metadata: {
 									tool: spec.managedToolId,
 									command: reinstalled,
+								},
+							});
+							const evidence = await installEvidenceForLaunch(
+								spec.managedToolId,
+								reinstalled,
+								reinstallAttempt,
+							);
+							if (
+								staleLaunch(
+									generation,
+									`${toolLabel}:forceReinstall-evidence`,
+									proc,
+								)
+							) {
+								return undefined;
+							}
+							logAvailabilityDecision({
+								tool: spec.managedToolId,
+								verdict: "available",
+								outcome: "success",
+								cause: "ok",
+								elapsedMs: Date.now() - installStartedAt,
+								latched: false,
+								classifiedBy: "caller",
+								producer: "lsp-launch",
+								evidence: {
+									...evidence,
+									correctsLatchedRow: false,
 								},
 							});
 							return { process: proc, source: "managed" };
@@ -662,21 +968,34 @@ export async function resolveAndLaunch(
 	}
 
 	// Step 4 — language-native runtime install (go install, gem install, …)
-	if (
-		spec.runtimeInstall &&
-		(await isOnPath(spec.runtimeInstall.runtimeCommand))
-	) {
-		const ok = await spec.runtimeInstall.install();
+	const runtimeInstall = spec.runtimeInstall;
+	const runtimeAvailable = runtimeInstall
+		? await isOnPath(runtimeInstall.runtimeCommand)
+		: false;
+	if (staleLaunch(generation, `${toolLabel}:runtimeAvailability`)) {
+		return undefined;
+	}
+	if (runtimeInstall && runtimeAvailable) {
+		const ok = await runtimeInstall.install();
+		if (staleLaunch(generation, `${toolLabel}:runtimeInstall`)) {
+			return undefined;
+		}
 		if (ok) {
-			const retry = spec.runtimeInstall.retryCandidates ?? spec.candidates;
+			const retry = runtimeInstall.retryCandidates ?? spec.candidates;
 			for (const command of retry) {
 				try {
 					const proc = await launchLSP(command, spec.args, {
 						cwd: spec.cwd,
 						env: spec.env,
 					});
+					if (staleLaunch(generation, `${toolLabel}:launchLSP:runtime`, proc)) {
+						return undefined;
+					}
 					return { process: proc, source: "managed" };
 				} catch (err) {
+					if (staleLaunch(generation, `${toolLabel}:launchLSP:runtime`)) {
+						return undefined;
+					}
 					trackRuntimeFailure(err);
 					// try next
 				}
@@ -1299,21 +1618,30 @@ async function findAncestorFileAmong(
  * Svelte). Without this guard an offline or partial install re-runs a 120 s
  * forced reinstall on every spawn.
  *
- * The guard is a plain module-level flag, so without an explicit re-arm it
+ * The guard is process-singleton state, so without an explicit re-arm it
  * would latch for the whole extension-host process — a repair that failed
  * once (transient registry hiccup) would stay unrepairable for every later
  * session in that process. `resetClassicTsRepairGuard` re-arms it; callers
  * wire that into `session_start` alongside the other per-session resets
  * (#1570).
  */
-let classicTsRepairAttempted = false;
+const CLASSIC_TS_REPAIR_FAMILY = "lsp.classic-ts-repair-guard";
+const CLASSIC_TS_REPAIR_VERSION = 1;
+
+function classicTsRepairState(): { attempted: boolean } {
+	return getProcessSingleton(
+		CLASSIC_TS_REPAIR_FAMILY,
+		CLASSIC_TS_REPAIR_VERSION,
+		() => ({ attempted: false }),
+	);
+}
 
 /** Re-arm the classic-repair guard so a new session gets its own attempt. */
 export function resetClassicTsRepairGuard(): void {
-	classicTsRepairAttempted = false;
+	classicTsRepairState().attempted = false;
 }
 
-/** Test hook — clears the per-process classic-repair guard. */
+/** Test hook — clears the process-singleton classic-repair guard. */
 export function _resetClassicTsRepairForTests(): void {
 	resetClassicTsRepairGuard();
 }
@@ -1431,7 +1759,7 @@ async function findTsserverPath(
 		discoveredTsserver ||
 		!discoveredTsc ||
 		!installAllowed ||
-		classicTsRepairAttempted
+		classicTsRepairState().attempted
 	) {
 		return discoveredTsserver;
 	}
@@ -1446,7 +1774,7 @@ async function findTsserverPath(
 	// An older managed tree took `latest` before the registry pinned the classic
 	// compiler. Reinstall the pinned version once so that tree self-heals,
 	// without deleting user or project-local TypeScript installations.
-	classicTsRepairAttempted = true;
+	classicTsRepairState().attempted = true;
 	logSessionStart(
 		`lsp typescript: managed compiler resolved to TypeScript ${discoveredVersion.version}, which ships no tsserver.js; reinstalling pinned classic fallback`,
 	);
@@ -2963,6 +3291,19 @@ export const BashServer: LSPServerInfo = {
 	name: "Bash Language Server",
 	extensions: [".bash", ".sh", ".zsh"],
 	root: FileDirRoot,
+	// #2194 bounded the installer's own verification at 20s; the dispatch
+	// touch's client-wait floor stayed at the shared 5s default, so a cold
+	// spawn could still race that budget and read as unavailable even after
+	// installer verification cleared it. Match the installer bound (#2169).
+	// `initializeTimeoutMs` matches it too: the measured cold start
+	// (9,667ms, #2194) has headroom under the unraised 15s default, but
+	// leaving the two fields mismatched is the same latent shape that made
+	// the Prisma/Vue raise a no-op (fix-round F1, #2233) — a slower host
+	// than the one measured would still hit the 15s inner kill despite the
+	// caller being willing to wait 20s. Equalizing costs nothing on the
+	// success path and removes the mismatch outright.
+	clientWaitTimeoutMs: 20_000,
+	initializeTimeoutMs: 20_000,
 	spawn(root, options) {
 		return resolveAndLaunch(
 			{
@@ -3075,6 +3416,13 @@ export const JsonServer: LSPServerInfo = {
 			[".git"],
 		]),
 	),
+	// See BashServer above: the installer's 20s verification bound (#2194)
+	// does not, on its own, raise the dispatch touch's cold-spawn wait floor.
+	// Mirror it here so a cold spawn cannot lose that race either (#2169).
+	// `initializeTimeoutMs` matches it for the same reason as BashServer
+	// above (fix-round F1, #2233).
+	clientWaitTimeoutMs: 20_000,
+	initializeTimeoutMs: 20_000,
 	spawn(root, options) {
 		return resolveAndLaunch(
 			{
@@ -3137,6 +3485,17 @@ export const PrismaServer: LSPServerInfo = {
 	root: RootWithFallback(
 		createRootDetector(["prisma/schema.prisma", "schema.prisma"]),
 	),
+	// Matches the installer's 40s verification bound above (#2169): the
+	// dispatch touch's cold-spawn wait floor defaults to 5s and would
+	// otherwise time the client out well before the binary answers.
+	// `initializeTimeoutMs` MUST be set alongside it (RubyServer's own
+	// precedent below): unset, it falls back to the 15s
+	// `INITIALIZE_TIMEOUT_MS` default in `clients/lsp/client.ts`, which
+	// hard-kills the child mid-handshake — a real cold Prisma run measured
+	// up to 27.3s, so the spawn would die there before this wait ever gets
+	// a chance to matter (fix-round F1, #2233).
+	clientWaitTimeoutMs: 40_000,
+	initializeTimeoutMs: 40_000,
 	spawn(root, options) {
 		return resolveAndLaunch(
 			{
@@ -3168,6 +3527,15 @@ export const VueServer: LSPServerInfo = {
 			]),
 		),
 	),
+	// Vue's launcher loads the full language-service bundle before answering,
+	// matching the installer's 30s verification bound (#2176). The dispatch
+	// touch's cold-spawn wait floor defaults to 5s and needs the same raise so
+	// a cold spawn cannot time out there instead. `initializeTimeoutMs` MUST
+	// match: unset, it falls back to the 15s default in `clients/lsp/client.ts`
+	// and hard-kills a cold spawn (measured up to 22.6s in #2188, 16.2s here)
+	// mid-handshake before this wait can matter (fix-round F1, #2233).
+	clientWaitTimeoutMs: 30_000,
+	initializeTimeoutMs: 30_000,
 	async spawn(root, options) {
 		const tsserverPath = await findTsserverPath(root, options?.allowInstall);
 
@@ -3218,6 +3586,13 @@ export const SvelteServer: LSPServerInfo = {
 			]),
 		),
 	),
+	// Matches the installer's 20s verification bound above (#2169): the
+	// dispatch touch's cold-spawn wait floor defaults to 5s and would
+	// otherwise time the client out well before the binary answers.
+	// `initializeTimeoutMs` matches it for the same reason as BashServer
+	// above (fix-round F1, #2233).
+	clientWaitTimeoutMs: 20_000,
+	initializeTimeoutMs: 20_000,
 	async spawn(root, options) {
 		const tsserverPath = await findTsserverPath(root, options?.allowInstall);
 		const proc = await resolveAndLaunch(
@@ -3365,7 +3740,13 @@ export const OpengrepServer: LSPServerInfo = {
 // Gate B). NOTE: the napi runner is NOT a subset — it delegates to napi's native
 // engine via root.findAll({rule}) (#206), the SAME Rust core as this LSP and the
 // ast-grep CLI, so rule semantics are identical across all three. The LSP's edge
-// is engine-driven codeAction fixes, not faithfulness of matching.
+// is engine-driven codeAction fixes, not faithfulness of matching. #2347 closed
+// the one known divergence under Gate B: the LSP/CLI resolve embedded `<script>`
+// bodies in HTML and run `language: JavaScript` rules inside them, and the napi
+// fallback now mirrors that (each script body is reparsed as JS and findings are
+// translated back to file coordinates). A future ast-grep embedded-content
+// surface (for example `<style>` bodies, which 0.45.1 does NOT inject) must land
+// on both routes together or be recorded here as an accepted divergence.
 const AST_GREP_KINDS = [
 	"csharp",
 	"cxx",

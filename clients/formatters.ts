@@ -21,6 +21,7 @@ import {
 	hasDetectableIndentation,
 } from "./dispatch/indent-detect.js";
 import { logLatency } from "./latency-logger.js";
+import { compareOrdinal } from "./string-utils.js";
 import {
 	type AvailabilityLatch,
 	classifyProbeFailure,
@@ -99,6 +100,16 @@ export async function tryLazyInstallFormatterTool(
  */
 export const SKIP_FORMATTING = "skip-formatting" as const;
 export type ResolvedFormatterCommand = string[] | null | typeof SKIP_FORMATTING;
+
+/**
+ * #1940: what formatter selection actually did to answer one file.
+ *
+ * `formatter_selected` fired only on a detection-cache miss, so cache hit rate
+ * was invisible and a cache-churning regression had no baseline. Emitting on
+ * both hit and miss with an explicit `outcome` discriminator gives hit rate
+ * from one record family with one denominator (`hit / (hit + miss)`).
+ */
+export type FormatterSelectionOutcome = "hit" | "miss";
 
 export interface FormatterInfo {
 	name: string;
@@ -368,6 +379,9 @@ function noteCooldownServedVerdict(
 		retryAfterMs: Math.max(1, retryAtMs - Date.now()),
 		budgetMs: WHICH_BUDGET_MS,
 		servedFromCooldown: true,
+		// No probe ran here: the latch's own remembered cause is replayed
+		// as-is, so the call site is the one asserting it (#2209).
+		classifiedBy: "caller",
 	});
 }
 
@@ -412,6 +426,7 @@ async function which(command: string): Promise<string | null> {
 			latched: true,
 			hostStallMs,
 			budgetMs: WHICH_BUDGET_MS,
+			classifiedBy: "probe",
 		});
 		return resolved;
 	}
@@ -433,9 +448,15 @@ async function which(command: string): Promise<string | null> {
 		...(proberRan && { unclassifiedFailureOutcome: "missing" as const }),
 	});
 	let { outcome, cause } = classified;
+	// This call site OVERRIDES classifyProbeFailure's own answer below, so a
+	// row it forced is a caller assertion, not a probe classification — the
+	// scrutiny availability-policy.ts:253-258 reserves for "caller" rows must
+	// not be laundered away by mislabeling this one "probe" (#2226 review F1).
+	let outcomeForced = false;
 	if (!proberRan && outcome !== "transient") {
 		outcome = "transient";
 		cause = "probe-rejected";
+		outcomeForced = true;
 	}
 	const retryAfterMs = entry.latch.noteUnavailable(outcome, cause);
 	if (outcome === "transient") whichTransientCommands.add(command);
@@ -453,6 +474,7 @@ async function which(command: string): Promise<string | null> {
 		hostStallMs,
 		...(retryAfterMs > 0 && { retryAfterMs }),
 		budgetMs: WHICH_BUDGET_MS,
+		classifiedBy: outcomeForced ? "caller" : "probe",
 	});
 	return null;
 }
@@ -1621,16 +1643,14 @@ const FORMATTER_CONFIG_FILES = [
 async function formatterConfigSignature(cwd: string): Promise<string> {
 	const paths = await findUp(FORMATTER_CONFIG_FILES, cwd);
 	const parts = await Promise.all(
-		paths
-			.sort((a, b) => a.localeCompare(b))
-			.map(async (filePath) => {
-				try {
-					const stat = await fs.stat(filePath);
-					return `${filePath}:${stat.mtimeMs}:${stat.size}`;
-				} catch {
-					return `${filePath}:missing`;
-				}
-			}),
+		paths.sort(compareOrdinal).map(async (filePath) => {
+			try {
+				const stat = await fs.stat(filePath);
+				return `${filePath}:${stat.mtimeMs}:${stat.size}`;
+			} catch {
+				return `${filePath}:missing`;
+			}
+		}),
 	);
 	return parts.join("|");
 }
@@ -1674,6 +1694,21 @@ export async function getFormattersForFile(
 
 	if (cached.entries.has(cacheKey)) {
 		const enabledNames = cached.entries.get(cacheKey);
+		const selectedFormatterName =
+			enabledNames && enabledNames.length > 0 ? enabledNames[0] : null;
+		logLatency({
+			type: "phase",
+			phase: "formatter_selected",
+			filePath: filePath,
+			durationMs: 0,
+			metadata: {
+				formatter: selectedFormatterName,
+				reason: "cache",
+				cached: true,
+				outcome: "hit" satisfies FormatterSelectionOutcome,
+				cwd,
+			},
+		});
 		if (!enabledNames || enabledNames.length === 0) return [];
 		// Return cached formatters by name (preserves priority order)
 		return ALL_FORMATTERS.filter((f) => enabledNames.includes(f.name));
@@ -1833,6 +1868,7 @@ export async function getFormattersForFile(
 		metadata: {
 			formatter: selected?.name ?? null,
 			reason: selectionReason,
+			outcome: "miss" satisfies FormatterSelectionOutcome,
 			cwd,
 			...(provisional && {
 				cached: false,

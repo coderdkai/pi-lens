@@ -7,6 +7,30 @@ on:
     branches: [master]
 
 jobs:
+  dependency-boundaries:
+    name: Dependency boundaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Build compiled clients
+        run: npm run build
+
+      - name: Check client dependency boundaries
+        run: npm run depcruise:check
+
   close-keyword-lint:
     name: Close-keyword syntax
     if: github.event_name == 'pull_request'
@@ -19,6 +43,8 @@ jobs:
           persist-credentials: false
 
       - name: Validate per-issue close keywords
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/check-close-keywords.mjs --lint-pr
 
   # #1844: the changelog-fragment format error hit four PRs in one day, each
@@ -125,6 +151,15 @@ jobs:
       - name: Ast-grep self-scan
         run: npm run astgrep:self-scan
 
+      # #2042: the size of the box the fork pool is budgeted against. The suite
+      # was OOM-killed here repeatedly and no log line said how much memory the
+      # runner actually had, so every diagnosis started from a guess.
+      - name: Runner capacity
+        run: |
+          echo "nproc=$(nproc)"
+          free -m
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || true
+
       - name: Run tests
         env:
           # Spawn-heavy MCP smokes retain a 20s local deadline but need room
@@ -136,7 +171,70 @@ jobs:
           # never contention to serialize — skip it explicitly rather than
           # relying on it being harmless.
           PI_LENS_TEST_NO_LOCK: '1'
-        run: npm test
+        # #2042: the wrapper changes nothing about what runs and forwards the
+        # child's exit code unchanged. It prints the host's memory low-water
+        # mark and a verdict line, so the next `Killed npm test` / exit 137 —
+        # which carries no failing assertion and reads as infrastructure noise —
+        # arrives with a number attached.
+        run: node scripts/with-memory-watch.mjs -- npm test
+
+      # #2042 round 2: the low-water mark falsified the memory story (three
+      # kills at 13.0-13.3 GB available of 16 GB, a green run LOWER at 13.1 GB)
+      # but it cannot name what sent the SIGKILL. The kernel can. `dmesg` says
+      # in one line whether the OOM killer fired and on whom; systemd-oomd
+      # kills on PSI pressure while memory still reads available, so it is the
+      # other authority worth asking. Every command is best-effort: this step
+      # must add evidence to a failure, never change its cause.
+      - name: Kernel kill evidence
+        if: failure()
+        run: |
+          set +e
+          # Round-2 review F2: an empty arm must distinguish "asked, nothing
+          # there" from "could not ask". Silence alone reads as the first and
+          # can be the second.
+          echo "--- kernel OOM/kill records ---"
+          dm=$(sudo dmesg -T 2>/dev/null)
+          if [ -z "$dm" ]; then
+            echo "(dmesg unavailable or empty - no evidence either way)"
+          else
+            hits=$(printf '%s\n' "$dm" |
+              grep -iE 'out of memory|oom-kill|oom_reaper|killed process' |
+              tail -40)
+            if [ -z "$hits" ]; then
+              echo "(dmesg readable, zero OOM/kill records - the kernel OOM killer did not fire)"
+            else
+              printf '%s\n' "$hits"
+            fi
+          fi
+          echo "--- systemd-oomd ---"
+          sudo journalctl -u systemd-oomd --no-pager -n 40 2>/dev/null ||
+            echo "(journalctl unavailable)"
+          # Round-2 review F1: reading /sys/fs/cgroup/memory.events reads the
+          # ROOT cgroup, which cgroup v2 does not populate. It printed nothing
+          # whether or not an event had occurred, so it could never support a
+          # claim either way. Resolve this process's OWN cgroup and walk up to
+          # the first ancestor that actually has the file.
+          echo "--- cgroup memory.events ---"
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.events"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.events absent or unreadable from '${cg:-unknown}' up to root - no cgroup evidence either way)"
+          fi
+          echo "--- memory now ---"
+          free -m
+          exit 0
 
   # Simulates pi's real install path: a `git:` install runs `npm install
   # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
@@ -157,6 +255,14 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: '22'
+
+      # npm 11.11 restored libc descriptors in lockfile v3 (#9025). Older npm
+      # silently removes them and installs both glibc and musl optional binaries.
+      # Keep this version in sync with the pin in release.yml (publish-npm job).
+      - name: Pin npm with libc-aware lockfile metadata
+        run: |
+          npm install --ignore-scripts --global npm@11.18.0
+          test "$(npm --version)" = "11.18.0"
 
       # #437: typescript is a devDependency (#402), so --omit=dev omits it. pi builds
       # the GitHub install from source under --omit=dev, so `build:dist` must resolve
@@ -230,6 +336,12 @@ jobs:
           git clone --quiet . "$RUNNER_TEMP/gh-install"
           cd "$RUNNER_TEMP/gh-install"
           npm install --omit=dev --no-audit --no-fund
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "ERROR: npm install --omit=dev changed tracked source files"
+            git status --short --untracked-files=no
+            git diff
+            exit 1
+          fi
           test -f dist/index.js || \
             (echo "ERROR: dist/index.js not built from a clean clone under --omit=dev" && exit 1)
           # #1926: the clean clone is the shape real users get. Assert pi's

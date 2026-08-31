@@ -1070,6 +1070,40 @@ describe("lens_diagnostics mode=full", () => {
 		});
 	});
 
+	// #2052 fix round 1 (F4d): a file outside every registered session root is
+	// declined before any server is asked. The full sweep must name that
+	// explicitly and must never let its empty placeholder read as clean.
+	it("renders an outside-project-root decline as unconfirmed, never as clean or a timeout (#2052)", async () => {
+		const lspService = {
+			runWorkspaceDiagnostics: vi.fn().mockResolvedValue([
+				{ filePath: "/proj/src/local.ts", diagnostics: [], count: 0 },
+				{
+					filePath: "/tmp/pi-agent-abc/src/foreign.ts",
+					diagnostics: [],
+					count: 0,
+					timedOut: true,
+					unconfirmedReason: "outside_project_root",
+				},
+			]),
+		};
+		const result = await run(makeTool({}, lspService), { mode: "full" });
+		const text = String(result.content[0].text);
+
+		expect(text).toContain("foreign.ts");
+		expect(text).toMatch(/unconfirmed/i);
+		// Pre-fix the sweep handed this file back as a confirmed clean, so it
+		// counted toward `lspFilesConfirmed` and never appeared in the note.
+		expect(text).toContain("outside every initialized session project root");
+		// A decline is permanent for this path — telling the reader it ran out
+		// of budget would send them into an infinite retry.
+		expect(text).not.toContain("within budget");
+		expect(result.details).toMatchObject({
+			lspFilesConfirmed: 1,
+			lspFilesUnconfirmed: 1,
+			unconfirmedLspFiles: ["/tmp/pi-agent-abc/src/foreign.ts"],
+		});
+	});
+
 	// #1618 review round 2: `findFullScanBindingMismatches` discovers a stale
 	// binding (`boundToCurrentDisk: false`) AFTER the sweep already returned
 	// the result as confirmed — no `.timedOut`, no `.error`, no
@@ -3404,6 +3438,247 @@ describe("lens_diagnostics disposition read-filter (#755)", () => {
 		const after = await run(makeTool(), { mode: "all" }, ddTmp);
 		expect(String(after.content[0].text)).not.toContain("bad call");
 		expect(after.details).toMatchObject({ mode: "all" });
+	});
+
+	it("mode=all immediately hides a strict false-positive", async () => {
+		const filePath = path.join(ddTmp, "false-positive.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		mockSummaries.push(
+			sum(
+				filePath,
+				{ blocking: 1, errors: 1 },
+				{
+					diagnostics: [
+						{
+							severity: "error",
+							semantic: "blocking",
+							message: "bad call",
+							line: 1,
+							rule: "no-bad",
+							tool: "opengrep",
+						},
+					],
+				},
+			),
+		);
+		expect(
+			String((await run(makeTool(), { mode: "all" }, ddTmp)).content[0].text),
+		).toContain("bad call");
+		await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "opengrep",
+			disposition: "false-positive",
+		});
+		expect(
+			String((await run(makeTool(), { mode: "all" }, ddTmp)).content[0].text),
+		).not.toContain("bad call");
+	});
+
+	// Review round (#2020): the three sibling cache-only sites below served
+	// stale strict-FP marks via the weak-only filter — only mode=all's site was
+	// fixed upstream. Each goes through the shared applyCachedDispositions seam
+	// now, so each pins its own immediate-convergence behavior.
+
+	it("mode=delta immediately hides a strict false-positive on an actionable warning", async () => {
+		const filePath = path.join(ddTmp, "fp-warning.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		const cacheData = {
+			"actionable-warnings": {
+				files: [
+					{
+						filePath,
+						displayPath: "fp-warning.ts",
+						warnings: [
+							{
+								id: "1",
+								filePath,
+								displayPath: "fp-warning.ts",
+								line: 1,
+								severity: "warning",
+								tool: "eslint",
+								rule: "no-bad",
+								message: "bad call",
+								actions: [],
+								suppressed: false,
+								origin: "dispatch",
+							},
+						],
+					},
+				],
+			},
+		};
+		expect(
+			String(
+				(await run(makeTool(cacheData), { mode: "delta" }, ddTmp)).content[0]
+					.text,
+			),
+		).toContain("bad call");
+		await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+		expect(
+			String(
+				(await run(makeTool(cacheData), { mode: "delta" }, ddTmp)).content[0]
+					.text,
+			),
+		).not.toContain("bad call");
+	});
+
+	it("empty-delta carried-over note respects a strict false-positive", async () => {
+		const filePath = path.join(ddTmp, "carried.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		mockSummaries.push({
+			filePath,
+			blocking: 0,
+			errors: 0,
+			warnings: 1,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{
+					severity: "warning",
+					message: "bad call",
+					line: 1,
+					rule: "no-bad",
+					tool: "eslint",
+				},
+			],
+		});
+		await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+		const result = await run(makeTool(), { mode: "delta" }, ddTmp);
+		const text = String(result.content[0].text);
+		expect(text).toContain("No");
+		expect(text).not.toContain("carried over");
+		expect(result.details).toMatchObject({
+			mode: "delta",
+			carriedOverFiles: 0,
+		});
+	});
+
+	it("project-diagnostics-delta report immediately hides a strict false-positive", async () => {
+		const cwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-diag-fp-delta-"),
+		);
+		try {
+			const filePath = path.join(cwd, "src", "fp-project.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = bad();\n");
+			projectDiagnosticsMocks.loadProjectDiagnosticsSnapshot.mockReturnValue(
+				undefined,
+			);
+			projectDiagnosticsMocks.loadProjectDiagnosticsDeltaReport.mockReturnValue(
+				{
+					version: 1,
+					cwd,
+					generatedAt: new Date().toISOString(),
+					sessionId: "session-1",
+					turnIndex: 1,
+					diagnostics: [
+						{
+							filePath,
+							line: 1,
+							severity: "error",
+							semantic: "blocking",
+							tool: "knip",
+							runner: "knip",
+							rule: "knip:unlisted",
+							message: "Unlisted dependency lodash",
+							source: "project-scan",
+						},
+					],
+					sources: ["knip"],
+					// biome-ignore lint/suspicious/noExplicitAny: test fixture for the mocked cache loader
+				} as any,
+			);
+			const before = await run(makeTool(), { mode: "delta" }, cwd);
+			expect(String(before.content[0].text)).toContain(
+				"Unlisted dependency lodash",
+			);
+			// The mark tool binds its cwd through its factory closure — build one
+			// for THIS project so the strict anchor lands in the same store the
+			// delta filter reads.
+			const markForProject = createLensDiagnosticMarkTool(() => cwd);
+			const marked = await markForProject.execute(
+				"m",
+				{
+					filePath,
+					line: 1,
+					message: "Unlisted dependency lodash",
+					rule: "knip:unlisted",
+					tool: "knip",
+					disposition: "false-positive",
+				},
+				undefined,
+				() => {},
+				{ cwd },
+			);
+			expect(marked.isError).toBeFalsy();
+			const after = await run(makeTool(), { mode: "delta" }, cwd);
+			expect(String(after.content[0].text)).not.toContain(
+				"Unlisted dependency lodash",
+			);
+			// Everything filtered → the empty-delta early return.
+			expect(after.details).toMatchObject({
+				mode: "delta",
+				carriedOverFiles: 0,
+			});
+		} finally {
+			removeTempDirSync(cwd);
+			resetProjectLensConfigCache();
+		}
+	});
+
+	it("a file edited after its diagnostics were observed falls back to weak-only (stale-content edge)", async () => {
+		// Strict-FP marks are content-bound: when the cached findings describe a
+		// superseded revision (mtime moved past the newest observedAt), deriving
+		// strict anchors from the NEW content could drop a different occurrence
+		// that merely shares the line number and text. The seam defers the strict
+		// mark to the next real dispatch instead of applying it here.
+		const filePath = path.join(ddTmp, "stale-fp.ts");
+		fs.writeFileSync(filePath, "const target = bad();\n");
+		mockSummaries.push({
+			filePath,
+			blocking: 0,
+			errors: 0,
+			warnings: 1,
+			hasFinalSnapshot: true,
+			diagnostics: [
+				{
+					severity: "warning",
+					message: "bad call",
+					line: 1,
+					rule: "no-bad",
+					tool: "eslint",
+					observedAt: Date.now() - 60_000,
+				},
+			],
+		});
+		// Edit AFTER observation: the cached finding is stale relative to disk.
+		fs.utimesSync(filePath, new Date(), new Date());
+		await runMark({
+			filePath,
+			line: 1,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+		const result = await run(makeTool(), { mode: "all" }, ddTmp);
+		expect(String(result.content[0].text)).toContain("bad call");
 	});
 
 	it("mode=full filtering is unaffected — its own content-based pass still runs", async () => {

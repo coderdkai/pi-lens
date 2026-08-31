@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyToolBinary } from "../../../clients/installer/index.js";
+import { safeSpawnAsync } from "../../../clients/safe-spawn.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let binDir = "";
@@ -79,15 +80,28 @@ describe("verifyToolBinary (#2015)", () => {
 		// safeSpawnAsync's tree-kill kills the whole tree -> no marker.
 		const marker = path.join(binDir, "grandchild-survived.marker");
 		const writer = path.join(binDir, "writer.cjs");
+		// The writer IGNORES SIGTERM (#2027 round-1): surviving a soft group
+		// TERM proves the SIGKILL escalation reaches the group even after the
+		// direct child has exited.
+		// CodeQL js/bad-code-sanitization: the marker path is NOT interpolated
+		// into the generated code - writer.cjs derives it from its own
+		// __dirname (it lives in binDir), so no taint reaches the embedded
+		// source.
 		fs.writeFileSync(
 			writer,
-			`setTimeout(() => require('fs').writeFileSync(${JSON.stringify(marker)}, 'survived'), 6000);`,
+			"process.on('SIGTERM', () => {});" +
+				"setTimeout(() => require('fs').writeFileSync(" +
+				"require('path').join(__dirname, 'grandchild-survived.marker'), 'survived'), 6000);",
 			"utf8",
 		);
+		// CodeQL js/bad-code-sanitization: strip every character cmd.exe / sh
+		// treat as special so the interpolated paths are provably inert. Our
+		// mkdtemp paths already satisfy the allowlist, so behavior is unchanged.
+		const safeWriter = writer.replace(/[^A-Za-z0-9_\\/. :-]/g, "_");
 		const body =
 			process.platform === "win32"
-				? `start "" /b node "${writer}"\r\nping -n 4 127.0.0.1 >nul`
-				: `node "${writer}" &\nsleep 3`;
+				? `start "" /b node "${safeWriter}"\r\nping -n 4 127.0.0.1 >nul`
+				: `node "${safeWriter}" &\nsleep 3`;
 		const bin = writeShim("slow-tool", body);
 		const transient = vi.fn();
 		const started = Date.now();
@@ -98,16 +112,115 @@ describe("verifyToolBinary (#2015)", () => {
 		expect(transient).toHaveBeenCalledTimes(1);
 
 		// Poll past the grandchild's scheduled write (+6s): no marker = the
-		// whole TREE died with the budget. Windows asserts this (taskkill /T).
-		// POSIX: killPidTreeSync kills only the direct child today - the
-		// grandchild legitimately survives (#2026) - so scope the assertion
-		// to Windows until safe-spawn gains group-kill, and never let a known
-		// platform gap read as a flake.
-		if (process.platform === "win32") {
-			for (let waited = 0; waited < 7_000; waited += 250) {
-				await new Promise((r) => setTimeout(r, 250));
-				expect(fs.existsSync(marker)).toBe(false);
-			}
+		// whole TREE died with the budget. Asserted on BOTH platforms:
+		// Windows via taskkill /T, POSIX via #2026 group-kill (detached
+		// spawn + negative-pid signal).
+		for (let waited = 0; waited < 7_000; waited += 250) {
+			await new Promise((r) => setTimeout(r, 250));
+			expect(fs.existsSync(marker)).toBe(false);
 		}
 	}, 25_000);
+
+	it("rescues a transport error emitted after the output cap trips", async () => {
+		const writer = path.join(binDir, "late-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.on('SIGTERM', () => {});" +
+				"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('Connection input stream is not set\\n'), 500);",
+			"utf8",
+		);
+		const safeWriter = writer.replace(/[^A-Za-z0-9_\\/. :-]/g, "_");
+		const bin = writeShim("late-rescue", `node "${safeWriter}"`);
+		await expect(
+			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
+		).resolves.toBe(true);
+	}, 15_000);
+
+	it("waits for a late rescue at the deterministic 2000ms cliff", async () => {
+		const writer = path.join(binDir, "late-rescue-cliff.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('Connection input stream is not set\\n'), 2000);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /Connection input stream is not set/,
+		});
+		expect(result.streamingMatch).toBe(true);
+		expect(result.outputTruncated).toBe(true);
+	}, 15_000);
+
+	it("does not invent a kill classification when an unmatched child exits", async () => {
+		const writer = path.join(binDir, "natural-exit-after-cap.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /never-matches/,
+		});
+		expect(result.status).toBe(0);
+		expect(result.signal).toBeUndefined();
+		expect(result.error).toBeUndefined();
+		expect(result.streamingMatch).toBeUndefined();
+		expect(result.outputTruncated).toBe(true);
+	}, 15_000);
+
+	it("matches a rescue split across output chunks", async () => {
+		const writer = path.join(binDir, "split-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.stderr.write('x'.repeat(70 * 1024));" +
+				"process.stderr.write('create');" +
+				"setTimeout(() => process.stderr.write('Connection\\n'), 50);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /createConnection/,
+		});
+		expect(result.streamingMatch).toBe(true);
+	}, 15_000);
+
+	it("uses the latch when head and tail retention cannot see the rescue", async () => {
+		const writer = path.join(binDir, "evicted-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => {" +
+				"process.stderr.write('Connection input stream is not set\\n' + 'y'.repeat(100 * 1024));" +
+				"}, 2000);",
+			"utf8",
+		);
+		const bin = writeShim("evicted-rescue", `node "${writer}"`);
+		await expect(
+			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
+		).resolves.toBe(true);
+	}, 15_000);
+
+	it("latches a matching chunk before retained output can discard it", async () => {
+		const writer = path.join(binDir, "streaming-latch.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.on('SIGTERM', () => {});" +
+				"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('RESCUE\\n'), 500);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /RESCUE/,
+		});
+		expect(result.outputTruncated).toBe(true);
+		expect(result.streamingMatch).toBe(true);
+	}, 15_000);
 });
